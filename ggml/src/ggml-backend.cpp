@@ -1441,11 +1441,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
-        // find the backend of the first split, skipping view ops
+        // find the backend of the first split, skipping view ops without a backend
         int i = 0;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-            if (!ggml_is_view_op(node->op)) {
+            if (!ggml_is_view_op(node->op) || tensor_backend_id(node) != -1) {
                 split->backend_id = tensor_backend_id(node);
                 break;
             }
@@ -1456,11 +1456,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
-            if (ggml_is_view_op(node->op)) {
+            const int node_backend_id = tensor_backend_id(node);
+
+            // a view doesn't allocate memory of its own, it is a window into its view_src, so a view
+            // assigned to another backend cannot be mapped by the backend of the current split
+            if (ggml_is_view_op(node->op) && node_backend_id == cur_backend_id) {
                 continue;
             }
-
-            const int node_backend_id = tensor_backend_id(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
