@@ -25,10 +25,11 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
 | F6 | loader `-lm dio` / `-lzm` 策略 | B | 多提交 | 未量化 | 暂不 |
 | F7 | MTP / dspark 投机解码优化 | C | 多提交 | 未量化 | 暂不 |
 | F8 | DeepSeek-V4 专项（topk-moe / hc 融合 / engram） | C | `75db26192` `5542318e7` `5c8b24021` 等 | 与本模型无关 | 不采纳 |
-| F9 | gfx906 权重重排（Q4_K/Q5_1/Q8_0/IQ4_NL/Q5_K） | A/B | `2e9d29fe7` `fcb857560` `b9a990b28` `b8baef09f` `481f684d3` | **本机 +23% prefill / +4% decode**（最大单项） | **下一步主菜**（未开始） |
+| F9 | gfx906 权重重排（Q4_K/Q5_1/Q8_0） | A/B | `2e9d29fe7` `fcb857560` `b9a990b28` `b8baef09f` `481f684d3` | **本机 +34% prefill**（pp512 337→451），decode 持平 | **已移植** `9706f6734` |
 
-推荐次序：**F2（已落）→ F9 → F1(+F4)**。F3 已否决、F3c 判定为"上游已有"。
-F9 是收益最大的单项且对照组在同一 build 内（`-nr 1`）；F1 是最大的重写，放最后。
+推荐次序：**F2（已落）→ F9（已落）→ F3/F3c（已否决）→ F1(+F4)**。
+F9 一次性拿到了 prefill 的 +34%，也顺带把配置结论改成 **layer 模式（PP8）优于 TP8**（见 F9 移植结果）。
+F1 只在需要「TP 的短上下文 prefill 优势」时才值得啃（它是最大的重写，且是永久下游补丁）。
 
 ---
 
@@ -180,8 +181,33 @@ Automatic, no flag. `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute
 - **增量计划**：① 骨架（CUDA extra-buft 接线 + 上传/重排 infra）+ **Q4_K**（44.6% 的字节）→ ② **Q5_1**（20.4%；fork 文档对
   "43 个 Q5_1 张量的 Qwen3.8-Flash-Next MoE" 报 +11% prefill，就是本模型）→ ③ Q8_0（503 个张量）→ ④ IQ4_NL / Q5_K →
   ⑤（可选）MoE up/gate 融合（实测只值 ~2% decode，优先级最低）。每步都用 `-nr 1` 出数字。
-- **数值验收**：K-quant 重排在 fork 文档里是 "byte-identical boots"、PPL 不变，但 greedy 生成可在**浮点重结合**范围内不同
-  → 按"允许 FP 重结合差异、PPL/首 200 token 语义一致"验收，而非 F2 那种逐位一致。
+- **数值验收**：K-quant 重排在 fork 文档里是 "byte-identical boots"、PPL 不变；本机实测 greedy 32 token 生成
+  **逐字节相同**（ON×2 / OFF 三组一致），比预期更干净。
+
+### 移植结果（2026-10-12，`9706f6734`）
+
+- **照搬**：`ggml/src/ggml-cuda/q8_repack/` 8 个文件（4516 行）字节级来自 fork，只改了三处依赖 fork-only 基础设施的地方，
+  且在原地写了注释说明：① `repack_quantize_src1_q8_1()` 里 **q8_1 激活缓存**（那是另一个独立特性）未移植，改为每次量化进自己的
+  fallback buffer；② 显存压力下的**列分块 + `try_alloc` 重试**未移植，改为一次性全量分配（prefill 宽度下只有几 MiB）；
+  ③ `ggml_backend_buffer_type_i` 的 vtable 按**上游新增的 `alloc_buffer_n`/`get_alloc_size_n` 槽位**补齐（7 参数顺序）。
+- **接线**（上游只有 CPU 侧有这套机制）：`ggml-cuda.cu` 的 include / `device_supports_buft` / `device_supports_op`（repacked 权重只能做
+  `MUL_MAT`/`MUL_MAT_ID` 的 src0 且 src1/dst 为 F32）/ `get_extra_bufts` proc / `mul_mat(_id)` 分发 / 屏蔽 canonical fused MMV；
+  `src/llama-model.cpp` 的 `make_gpu_buft_list(..., use_extra_bufts)`（extra buft 放在默认 buft **之前**，`--repack` 可关）；
+  两个 `CMakeLists.txt` 加 `q8_repack/*.cu|cuh` 的 glob。
+- **类型门**：`ggml_cuda_repack_tensor_supported()` 只放行 **Q4_K / Q5_1 / Q8_0** —— 这是实测出来的组合：
+  单独加 Q4_K +2%、再加 Q5_1 +9%、再加 Q8_0 **+34%**；本模型剩下的 IQ4_NL（PLE 表，走 GET_ROWS 本来就不会被 repack）与 Q5_K（0.9%）
+  放开后反而 **−2%**（两次复现、回退后复现原值），MXFP4/Q6_K 本模型没有、无法验证，故一并排除。要放开是一行改动。
+- **实测**（8×MI50，`-sm layer`，`-lm dio`，`-r 3`，同 build 内 `--repack 0` 对照）：
+
+  | 配置 | pp512 | pp2048 | pp4096 | tg128 |
+  |---|---|---|---|---|
+  | repack off | 337.2 | 850.3 | 1092.1 | 34.50 |
+  | repack on（Q4_K+Q5_1+Q8_0） | **451.3** | **1161.6** | **1468.4** | 35.26 |
+
+- **配置结论变了**：repack 只在 layer 模式下生效（`-sm tensor` 下 ON/OFF 完全相同，因为 meta 设备没接这套），
+  而 repack 后的 PP8 在 pp2048/4096/decode 上全面超过 TP8（1162/1468/35.3 对 519/514/34.1）→ **目标配置从 TP8 改为 PP8**。
+- **没移植的部分**：① fork 的 MoE up/gate 融合 mat-vec（decode 约 +2%，本机未测出更大）；② `ggml-backend-meta.cpp` 的 TP 接线（~188 行）；
+  ③ Q8_1 激活复用（独立特性）；④ 显存压力列分块。前两项是后续候选。
 
 ## F1 多级 TP `-tps`（TP×PP）
 
