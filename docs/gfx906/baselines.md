@@ -206,6 +206,17 @@ MoE 融合拆分（`GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0`）：pp512 446.17 / pp
   （off 列与 §3.1/§2 的上游基线 pp16384 1339.6、pp65536 1150.0 对得上，即这一列就是上游水平；
   长上下文收益变小的原因是 attention 项占比上升。）
 
+- **MoE up/gate 融合 mat-vec**（同一 build，对照 `GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0`，repack 全开）：
+
+  | | tg128 | pp512 | pp2048 | pp4096 |
+  |---|---|---|---|---|
+  | 融合 off | 35.26 | 450.7 | 1160.7 | 1467.2 |
+  | 融合 on | **35.87 / 36.30** | 451.6 | 1161.7 | 1467.7 |
+
+  - witness：`[repack-moe-fusion] type=q4_K cols=1 fused up/gate mat-vec engaged`（需 `llama-bench -v`）。
+  - 数值：batch=1 的 PPL（8×512 token，`llama-perplexity -b 1 --chunks 8`）4.2282（on）vs 4.2120（off）= +0.38%（±0.23）；
+    batch=512 的 PPL 两者完全相同 3.7710（该路径不触发融合）。greedy 输出在 width 1 会分叉（前约 150 字符一致）。
+
 - **`-sm tensor`（TP8）**：repack ON 539.1/519.2/513.6/34.10 × OFF 538.9/517.7/515.2/34.10 → **无差别**。
   原因：上游 GPU 权重加载从不向 meta 设备索要 extra buft，要 TP 下生效需移植 fork 的
   `ggml-backend-meta.cpp` 那 ~188 行。**因此本项目的目标配置从 TP8 改为 layer 模式（PP8）**：

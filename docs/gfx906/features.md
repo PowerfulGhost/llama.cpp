@@ -206,8 +206,29 @@ Automatic, no flag. `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute
 
 - **配置结论变了**：repack 只在 layer 模式下生效（`-sm tensor` 下 ON/OFF 完全相同，因为 meta 设备没接这套），
   而 repack 后的 PP8 在 pp2048/4096/decode 上全面超过 TP8（1162/1468/35.3 对 519/514/34.1）→ **目标配置从 TP8 改为 PP8**。
-- **没移植的部分**：① fork 的 MoE up/gate 融合 mat-vec（decode 约 +2%，本机未测出更大）；② `ggml-backend-meta.cpp` 的 TP 接线（~188 行）；
-  ③ Q8_1 激活复用（独立特性）；④ 显存压力列分块。前两项是后续候选。
+### MoE / 稠密 up+gate 融合 mat-vec（`9706f6734` 之后追加）
+
+- **做了什么**：把 repack 的融合 mat-vec 接进上游 `ggml_cuda_try_fuse` 的**裸** `{MM(_ID), MM(_ID), GLU}` 分支
+  （`ggml-cuda.cu`：一个 `ggml_cuda_repack_fusion_glu_ok()` 判别 + 一段分发，约 35 行）。该分支无 bias、无 scale，
+  正好是融合核支持的形状；**带 bias/scale 的 GLU 分支保持 canonical**，不替换（那些形状融合核没有实现，替换会算错）。
+- **触发条件**：up/gate 两个权重都在 repack 布局、类型被 `ggml_cuda_repack_mmv{,_id}_fusion_supported()` 放行
+  （MoE 侧本模型专家是 Q4_K ✓；稠密侧只放 Q8_0/MXFP4 —— 本模型注意力投影是 Q8_0 ✓）、宽度在
+  `ggml_cuda_repack_mmv_fusion_width_ok()` 内（稠密 1 token，MoE ≤8 token）。
+- **实测**（8×MI50，`-sm layer`，`-lm dio`，repack 全开，r=3；对照 `GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0`）：
+
+  | | tg128 | pp512 | pp2048 | pp4096 |
+  |---|---|---|---|---|
+  | 融合 off | 35.26 | 450.7 | 1160.7 | 1467.2 |
+  | 融合 on | **35.87 / 36.30** | 451.6 | 1161.7 | 1467.7 |
+
+  prefill 不变（融合只在窄 batch 存在）。witness：`llama-bench -v` 下 `[repack-moe-fusion] type=q4_K cols=1 fused up/gate mat-vec engaged`。
+- **数值代价（重要）**：width-1（= 普通 decode）下融合核的**归约顺序**与 canonical 不同 → greedy 输出会分叉
+  （前约 150 字符一致，然后某个 token 翻转、之后文本完全不同）。batch=1 的 PPL（8×512 token）：**4.2282（融合）vs 4.2120（不融合），+0.38%**，
+  误差棒 ±0.23；batch=512 的 PPL **完全相同 3.7710**（那条路径不触发融合）。
+  与 fork 文档 "differ at width 1 by reduction order" 一致，属固有性质而非算错 → **默认开**，`GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0` 关掉专家侧。
+
+- **仍未移植**：① `ggml-backend-meta.cpp` 的 TP 接线（~188 行，TP 下 repack 才生效）；② Q8_1 激活复用（独立特性，fork 称 +2.2~2.6%）；
+  ③ 显存压力列分块与 `try_alloc` 重试；④ 稠密 bias-only（`{MM, ADD}`）融合。
 
 ## F1 多级 TP `-tps`（TP×PP）
 
