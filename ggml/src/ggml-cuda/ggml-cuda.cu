@@ -1974,6 +1974,20 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+// The repack fused MMV epilogue implements SWIGLU, GEGLU and SWIGLU_OAI at its fixed
+// alpha 1.702 / limit 7.0. Anything else keeps its own GLU node.
+static bool ggml_cuda_repack_fusion_glu_ok(const ggml_tensor * glu) {
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+            return true;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -4325,6 +4339,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src0 = up->src[0];
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
+
+            // Repacked weights: fuse the up/gate dot products in the repacked mat-vec. Both lanes
+            // share the quantized input and, with ids, the same expert lookup; without this the
+            // repacked path runs up, gate and the GLU as three launches where the canonical path
+            // runs one, which is where its decode deficit comes from. This branch is the plain
+            // {MUL_MAT(_ID), MUL_MAT(_ID), GLU} shape - no bias, no scale - which is exactly what
+            // the fused repack kernels implement; everything else keeps the canonical path.
+            const bool repack_fusion_types_ok = ids == nullptr
+                ? ggml_cuda_repack_mmv_fusion_supported(src0) && ggml_cuda_repack_mmv_fusion_supported(gate->src[0])
+                : ggml_cuda_repack_mmv_id_fusion_supported(src0) && ggml_cuda_repack_mmv_id_fusion_supported(gate->src[0]);
+            if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
+                ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
+                repack_fusion_types_ok &&
+                ggml_cuda_repack_fusion_glu_ok(glu) &&
+                ggml_cuda_repack_mmv_fusion_width_ok(ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate   = gate->src[0];
+                fusion_data.glu_op = ggml_get_glu_op(glu);
+
+                if (ids == nullptr) {
+                    ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
+                } else {
+                    // Witness for the fused expert path, once per type per process.
+                    static std::atomic<bool> repack_fusion_witnessed[GGML_TYPE_COUNT];
+                    if (src0->type < GGML_TYPE_COUNT && !repack_fusion_witnessed[src0->type].load(std::memory_order_relaxed)
+                            && !repack_fusion_witnessed[src0->type].exchange(true, std::memory_order_acq_rel)) {
+                        GGML_LOG_WARN("[repack-moe-fusion] type=%s cols=%d fused up/gate mat-vec engaged\n",
+                                      ggml_type_name(src0->type), (int) glu->ne[2]);
+                    }
+                    ggml_cuda_mul_mat_id_vec_repacked_fused(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
