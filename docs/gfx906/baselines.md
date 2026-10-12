@@ -99,6 +99,22 @@ TP custom AllReduce: auto-selected two-shot for 8-rank decode-sized tensors
 
 > 需要更多重复才能判定这 ~4% 是否真实：把 `-r` 提到 8，或改测 `-n 256`。
 
+### 3.1.1 token 一致性（同一 patch，脚本 `scripts/f2-custom-ar-consistency.sh`）
+
+贪心解码 `--temp 0 --seed 1 -n 32 -st`，prompt = `alpha bravo charlie delta echo foxtrot`：
+
+| 配置 | 结果 |
+|---|---|
+| `-sm layer`（PP8） | 与下面两者逐字节一致 |
+| `-sm tensor` + 自定义 AR | 与上、下两者逐字节一致 |
+| `-sm tensor` + `GGML_ENABLE_CUSTOM_AR=0`（RCCL） | 与上两者逐字节一致 |
+
+结论：**通过** ✅ —— 三条路径给出完全相同的 32 token 输出（连 PP8 与 TP8 在这个短贪心生成上也一致）。
+
+> 坑：不要直接对 stdout 取 md5。stdout 里含 `[ Prompt: x t/s | Generation: y t/s ]`，该行每次必然不同，
+> 会出现“三组全不一致”的假警报；剔除该行后完全一致。
+> 另外，默认 verbosity 会吞掉 `TP custom AllReduce: initialized ...` 这条 INFO，取证时需要给 `llama-cli` 加 `-v`。
+
 ## 4. 与模型相关的关键事实（供以后判断）
 
 - 权重里约 **27465 MiB（26.8 GiB）是 host-mapped 的 PLE 表**（`per_layer_token_embd.weight`，

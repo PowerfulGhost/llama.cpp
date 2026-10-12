@@ -110,6 +110,7 @@ git config rebase.autostash true    # 有杂项改动时自动 stash
 |---|---|
 | [`features.md`](features.md) | 可移植特性清单：来源 commit、涉及文件、冲突等级、实测收益、采纳状态 |
 | [`baselines.md`](baselines.md) | 实测基线：环境、命令、数字、适用范围与坑 |
+| `scripts/` | 可复现的测量脚本（`f2-custom-ar-ab.sh` A/B、`f2-custom-ar-consistency.sh` token 一致性），每个脚本头部带 docker 调用命令 |
 
 ## 4. 相关路径（本机）
 

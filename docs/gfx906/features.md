@@ -53,6 +53,13 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
   - A/B（开/`GGML_ENABLE_CUSTOM_AR=0`）：pp512 543.5/539.4、pp2048 518.7/519.8、tg128 33.80/32.44 —— tg 上 +4.2% 但落在 ±3.1 噪声内，**TP8 + RCCL 场景未见显著收益**
 - **结论/下一步**：该 patch 的价值主要在 (a) 作为 F1 `-tps` 的前置（fork 的 +5% 是在多级 TP 下测的），(b) 提供一条**不依赖 RCCL/`--ipc=host`** 的通路（强制 one-shot：`GGML_TP_AR_ONESHOT=1`，可用于 RCCL 起不来或 shm 受限的环境）。要判定 tg 上那约 4% 是否真实，需把 `-r` 提到 8 或改测 `-n 256`。
   - 相关开关：`GGML_ENABLE_CUSTOM_AR=0` 关、`GGML_TP_AR_NO_GATE=1` 关尺寸门限、`GGML_TP_AR_ONESHOT=1` 强制 one-shot、`GGML_TP_AR_TWOSHOT=0/1` 强制模式、`GGML_TP_AR_TWOSHOT_MIN_NE` 改阈值、`GGML_TP_AR_KTIMING` 打印计时。
+- **token 一致性验收：通过** ✅（脚本 `scripts/f2-custom-ar-consistency.sh`）。
+  贪心解码（`--temp 0 --seed 1 -st`）32 token，比对**生成文本**：
+  `-sm layer`(PP8) ≡ `-sm tensor` + 自定义 AR ≡ `-sm tensor` + `GGML_ENABLE_CUSTOM_AR=0`(RCCL)，
+  三者逐字节一致（生成：`We need respond to user: "alpha bravo charlie delta echo foxtrot". Likely they are
+  spelling NATO phonetic alphabet first six letters. Need maybe continue`）。
+  > 方法上的坑：第一次直接比对 stdout 的 md5 会“四组全不一致”——因为 stdout 里含性能行
+  > `[ Prompt: x t/s | Generation: y t/s ]`，那里每次必然不同；剔除该行后完全一致。
 
 ## F3 gfx906 内核
 
