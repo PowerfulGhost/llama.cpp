@@ -130,6 +130,19 @@ TP custom AllReduce: auto-selected two-shot for 8-rank decode-sized tensors
 > ⚠️ 测量坑（踩了两次）：**llama-bench 默认 verbosity 会吞掉 WARN**。
 > 所有 `GGML_LOG_WARN`（包括自定义诊断打印与 fork 的 `gdn-chunk-snapshots` 公告）都必须加 `-v` 才看得到。
 
+### 3.2.1 长上下文补测（同一对二进制，`-p 16384,65536 -n 128 -r 2`）
+
+| test | chunked | 串行 | 差值 |
+|---|---:|---:|---:|
+| pp16384 | 1282.71 ± 33.07 | 1339.60 ± 0.92 | **−4.2%** |
+| pp65536 | 1105.29 ± 4.09 | 1150.01 ± 2.29 | **−3.9%** |
+| tg128 | 33.79 ± 0.49 | 34.45 ± 0.24 | −1.9% |
+
+长上下文下 chunked 更慢（方差小，−4% 可信）；短上下文持平。因此回退的理由从“无收益”变为“**长上下文回归**”。
+同时得到两个新的长上下文基线（上游+F2、`-sm layer`、`-lm dio`）：**pp16384 1339.60**、**pp65536 1150.01 t/s**。
+
+> llama-bench 没有 `-c/--ctx-size` 参数（会报 `invalid parameter for argument: -c`），上下文由 `-p`/`-n` 自动推导。
+
 ## 4. 与模型相关的关键事实（供以后判断）
 
 - 权重里约 **27465 MiB（26.8 GiB）是 host-mapped 的 PLE 表**（`per_layer_token_embd.weight`，
