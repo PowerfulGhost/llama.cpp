@@ -78,7 +78,22 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
 // an MXFP4 sub-block is a single uint4 of nibbles, so that kernel's half-block
 // indexing (2 uint4 per sub-block) has no MXFP4 equivalent. MXFP4 reaches the GEMM
 // for every token count instead, so it must not be offered the fusion.
+// The fused up/gate mat-vec folds three launches into one and is worth +2..3% decode, but at
+// width 1 it reduces in a different order than the canonical path: greedy output diverges and
+// batch-1 perplexity moves by ~0.4%. It is therefore opt-in - set GGML_CUDA_REPACK_MMV_FUSION=1
+// to enable it. Nothing else depends on it: the unfused repack path is unaffected.
+static bool ggml_cuda_repack_mmv_fusion_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_MMV_FUSION");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
+    if (!ggml_cuda_repack_mmv_fusion_enabled()) {
+        return false;
+    }
     const ggml_tensor * t = src0->view_src != nullptr ? src0->view_src : src0;
     return (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_MXFP4) &&
            ggml_cuda_repack_mul_mat_should_fire(src0);
@@ -88,6 +103,9 @@ bool ggml_cuda_repack_mmv_fusion_supported(const ggml_tensor * src0) {
 // The dense fusion stays on the predicate above until its K-quant and bias variants have their own gate.
 // GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0 keeps the expert path on the Q8_0 and MXFP4 admission.
 bool ggml_cuda_repack_mmv_id_fusion_supported(const ggml_tensor * src0) {
+    if (!ggml_cuda_repack_mmv_fusion_enabled()) {
+        return false;
+    }
     static const bool kquant = [] {
         const char * env = getenv("GGML_CUDA_REPACK_KQUANT_MOE_FUSION");
         return env == nullptr || atoi(env) != 0;

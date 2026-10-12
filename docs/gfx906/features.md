@@ -225,7 +225,9 @@ Automatic, no flag. `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute
 - **数值代价（重要）**：width-1（= 普通 decode）下融合核的**归约顺序**与 canonical 不同 → greedy 输出会分叉
   （前约 150 字符一致，然后某个 token 翻转、之后文本完全不同）。batch=1 的 PPL（8×512 token）：**4.2282（融合）vs 4.2120（不融合），+0.38%**，
   误差棒 ±0.23；batch=512 的 PPL **完全相同 3.7710**（那条路径不触发融合）。
-  与 fork 文档 "differ at width 1 by reduction order" 一致，属固有性质而非算错 → **默认开**，`GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0` 关掉专家侧。
+  与 fork 文档 "differ at width 1 by reduction order" 一致，属固有性质而非算错。
+- **开关：默认关**（`GGML_CUDA_REPACK_MMV_FUSION`，未设=0）。理由：本项目对数值路径的默认要求是逐位一致，而这一项在 width 1 不满足；
+  需要 decode 那 2~3%（实测 34.97 → 36.56，+4.5%）时显式开。专家侧另有细开关 `GGML_CUDA_REPACK_KQUANT_MOE_FUSION`（在融合已开的前提下，默认 1）。
 
 - **仍未移植**：① `ggml-backend-meta.cpp` 的 TP 接线（~188 行，TP 下 repack 才生效）；② Q8_1 激活复用（独立特性，fork 称 +2.2~2.6%）；
   ③ 显存压力列分块与 `try_alloc` 重试；④ 稠密 bias-only（`{MM, ADD}`）融合。

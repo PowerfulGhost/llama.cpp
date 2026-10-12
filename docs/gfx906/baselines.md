@@ -206,12 +206,13 @@ MoE 融合拆分（`GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0`）：pp512 446.17 / pp
   （off 列与 §3.1/§2 的上游基线 pp16384 1339.6、pp65536 1150.0 对得上，即这一列就是上游水平；
   长上下文收益变小的原因是 attention 项占比上升。）
 
-- **MoE up/gate 融合 mat-vec**（同一 build，对照 `GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0`，repack 全开）：
+- **MoE up/gate 融合 mat-vec**（同一 build，repack 全开）。**默认关**，`GGML_CUDA_REPACK_MMV_FUSION=1` 打开；
+  下表 ON 列 = 打开后，OFF 列 = 默认（另可用 `GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0` 只关专家侧）：
 
   | | tg128 | pp512 | pp2048 | pp4096 |
   |---|---|---|---|---|
   | 融合 off | 35.26 | 450.7 | 1160.7 | 1467.2 |
-  | 融合 on | **35.87 / 36.30** | 451.6 | 1161.7 | 1467.7 |
+  | 融合 on | **35.87 / 36.30 / 36.56** | 451.6 | 1161.7 | 1467.7 |
 
   - witness：`[repack-moe-fusion] type=q4_K cols=1 fused up/gate mat-vec engaged`（需 `llama-bench -v`）。
   - 数值：batch=1 的 PPL（8×512 token，`llama-perplexity -b 1 --chunks 8`）4.2282（on）vs 4.2120（off）= +0.38%（±0.23）；
