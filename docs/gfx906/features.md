@@ -110,6 +110,32 @@ fork 剩下的只有 J 扫描里的 VEGA20 占用门控（`J > 64` 时要求 til
   → 结论由“0 收益”升级为“短上下文持平、长上下文 **−4%** 且非 bit-exact”，**回退**无疑。
 - 顺带得到两个新的长上下文基线（上游+F2、`-sm layer`、`-lm dio`）：**pp16384 1339.60**、**pp65536 1150.01 t/s**。
 
+### F3b 的 kernel 级隔离测量（`test-backend-ops perf`）
+
+上面都是端到端。kernel 本身的差距可以用仓库自带的 op 级性能 harness 直接测：
+`test-backend-ops perf -o GATED_DELTA_NET`（用例在 `tests/test-backend-ops.cpp:4899`）。
+同一 harness、同一 shape、只换 kernel，每 shape 取 8 次采样的中位数（ROCm0）：
+
+| shape | 串行 µs/run | chunked µs/run | chunk/串行 |
+|---|---:|---:|---:|
+| H=32 S_v=128 tok=64 kda=0（**不满足 chunk 条件**） | 161.3 | 161.3 | 1.00x |
+| H=32 S_v=128 tok=256 kda=0 | 539.1 | 725.8 | **1.35x** |
+| H=32 S_v=128 tok=512 kda=0 | 1052.4 | 1456.4 | **1.38x** |
+| H=32 S_v=128 tok=1024 kda=0 | 2093.7 | 3000.4 | **1.43x** |
+| H=4 S_v=128 tok=256 kda=0 | 318.4 | 248.9 | **0.78x** |
+| H=4 S_v=128 tok=512 kda=0 | 853.6 | 571.9 | **0.67x** |
+| H=4 S_v=128 tok=1024 kda=0 | 1874.2 | 1150.1 | **0.61x** |
+| H=32 S_v=128 tok=64 kda=1（CS=16，已满足） | 277.4 | 297.4 | 1.07x |
+| H=32 S_v=128 tok=1 / H=16 S_v=64 tok=1（均不满足） | 32.4 / 15.6 | 32.5 / 15.7 | 1.00x |
+
+**读法**：不满足 chunk 条件的 shape 两个 kernel 逐位相同（1.00x）——这就是该表的对照组。
+真正的变量是 **H（value head 数）**：H=4（CTA 少、串行核每 token 都要把 state 写回 HBM）时 chunk 快 1.3~1.6x；
+H=32（串行核已有足够 CTA 填满 GPU）时 chunk 反而慢 1.35~1.43x。
+本模型 48 层里有 **36 层** 带 GDN（`blk.*.ssm_out.weight`，3 层 GDN + 1 层 attention 循环），
+`qwen4exp.ssm.inner_size=6144 / state_size=128`，E2E 在长上下文是 −4%——即落在 **H 大**的那一侧。
+若按 op 级 1.4x、E2E −4% 反推，GDN op 约占 prefill 的 **10%**。
+→ 这个 kernel 是给 head 数少的模型准备的（也就是那条上游 PR 的目标场景），对我们不适用。
+
 ### 新线索（待评估）：BF16 compute on gfx906（F3c）
 
 fork `FEATURES.md` 有独立一节：*“On AMD parts predating CDNA and RDNA3, BF16 matmuls compute in F32 …
