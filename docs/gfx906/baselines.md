@@ -76,6 +76,29 @@ decode 两者接近（PP8 略优）。**tg8 之类的短测会被一次性开销
 - `LLAMA_PLE_SHARD` 在 8 卡热缓存下 **±2%（无收益）**，特性确实生效（日志 `sharding the PLE gather table across the TP group`），
   但文档的 4×MI50 冷缓存 2 倍收益复现不了（见 `features.md` F5）。
 
+## 3.1 F2 自定义 AllReduce 的 A/B（本仓库 `75aba2e4e`，2026-10-12）
+
+上游 `f2cc7282c` + 单个 patch（`tp-allreduce.{cu,cuh}` + `ggml-cuda.cu` 147 行），
+`-sm tensor`、`-lm dio`、`HSA_FORCE_FINE_GRAIN_PCIE=1`、`-p 512,2048 -n 128 -r 3`：
+
+| 配置 | pp512 | pp2048 | tg128 |
+|---|---:|---:|---:|
+| 自定义 AR 开（默认） | 543.46 ± 2.37 | 518.70 ± 3.05 | 33.80 ± 3.15 |
+| `GGML_ENABLE_CUSTOM_AR=0` | 539.44 ± 8.95 | 519.83 ± 2.80 | 32.44 ± 2.79 |
+
+**结论：在 8 卡 TP8 + RCCL 场景下差异落在噪声内**（tg 上 +4.2% 但 σ≈3；pp 基本不变）。
+路径确认已生效（日志）：
+
+```
+TP custom AllReduce: initialized for 8 GPUs, path = broadcast F32 + twoshot F32 (peer-write, size-adaptive, lossless)
+TP custom AllReduce: auto-selected two-shot for 8-rank decode-sized tensors
+```
+
+不设 `HSA_FORCE_FINE_GRAIN_PCIE=1` 时：`path = one-shot (PCIe without HSA_FORCE_FINE_GRAIN_PCIE=1, ...)`，
+且因为 RCCL 可用，所有集合通信仍然走 RCCL（prepare 自行拒绝）。
+
+> 需要更多重复才能判定这 ~4% 是否真实：把 `-r` 提到 8，或改测 `-n 256`。
+
 ## 4. 与模型相关的关键事实（供以后判断）
 
 - 权重里约 **27465 MiB（26.8 GiB）是 host-mapped 的 PLE 表**（`per_layer_token_embd.weight`，

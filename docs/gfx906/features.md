@@ -17,7 +17,7 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
 
 | # | 特性 | 级别 | 来源（fork commit） | 实测/文档收益 | 状态 |
 |---|---|---|---|---|---|
-| F2 | 自定义 AllReduce（PCIe 友好） | A/B | `04f89ab03` `5f65f9fa3` `41c46cedb` `92607b5d1` `19d784ad0` `743037eae` | 文档 +5%（decode） | 未开始 |
+| F2 | 自定义 AllReduce（PCIe 友好） | A/B | `04f89ab03` `5f65f9fa3` `41c46cedb` `92607b5d1` `19d784ad0` `743037eae` | 本机 A/B 在噪声内；fork 文档 +5%（decode） | **已移植** `75aba2e4e` |
 | F3 | gfx906 内核（MMQ/Q8 repack/gated-delta chunk） | A/B | `2335544ab` `fcb857560` `55b275262` `1248e5e37` `b8baef09f` | 文档 +6~8%（decode） | 未开始 |
 | F1 | 多级 TP `-tps`（TP×PP） | C | `04f89ab03` + 后续 | **本机实测 +8.5% decode**（见 baselines） | 未开始 |
 | F4 | meta/调度流水线修复（依附 F1） | C | `c7069d868` `7f117dcd2` `27e980a21` `46b95d97e` `2d05207b6` `a355590d2` `be8ff98aa` `62d4be47d` `b8efb9510` | 文档 +37% layer prefill 等 | 依赖 F1 |
@@ -41,6 +41,18 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
 - **为什么值得做**：这是唯一"纯新文件"的高价值项，且本机是纯 PCIe（RCCL ring 在这种拓扑上并不优）。
 - **移植要点**：先只落新文件 + 选择链挂点，保持 `-tps 0`（= 官方 `-sm tensor`）路径，跑通并 A/B 出数字后再做 F1。
 - **验证**：`-sm tensor` 下 token 一致性（求和顺序改变）+ `-p 512,2048 -n 128` 对比。
+
+### 移植结果（2026-10-12，`75aba2e4e`）
+
+- `tp-allreduce.cu/.cuh` **逐字节照搬** fork（便于以后三方比对更新）；`.cu` 由现有的 `file(GLOB "*.cu")` 自动纳入构建。
+- `ggml-cuda.cu` **+147/−1**，只有三处接线：comm_context 加 `ar_plan`/`custom_ar`/`use_custom_ar`（析构里 destroy）、`comm_allreduce_custom{,_prepare}` 插在 `try_allreduce` 指针**之前**（按 F32 / 尺寸门限 / peer-write 可用性自行拒绝）、`comm_init` 里按 `GGML_ENABLE_CUSTOM_AR`（默认开）初始化。
+- **刻意排除**（属 F1/F4）：fork 的 `xfer_staging_*` 暂存环、`staging_depth`、`set_pipeline_stages`、以及给 meta 后端用的 fused-dispatch 入口（`allreduce_prepare`/`launch_rank`）。因此本 patch **不依赖 `-tps`**，对 `-tps 0`（= 官方 `-sm tensor`）的调用方完全透明。
+- **实测（8×MI50，`-sm tensor`，`-lm dio`，`-p 512,2048 -n 128 -r 3`）**：
+  - `HSA_FORCE_FINE_GRAIN_PCIE=1` → 日志 `path = broadcast F32 + twoshot F32 (peer-write, size-adaptive, lossless)` + `auto-selected two-shot for 8-rank decode-sized tensors`
+  - 不设该变量 → `path = one-shot`，且因 RCCL 可用，所有集合通信用回 RCCL（**设计如此**）
+  - A/B（开/`GGML_ENABLE_CUSTOM_AR=0`）：pp512 543.5/539.4、pp2048 518.7/519.8、tg128 33.80/32.44 —— tg 上 +4.2% 但落在 ±3.1 噪声内，**TP8 + RCCL 场景未见显著收益**
+- **结论/下一步**：该 patch 的价值主要在 (a) 作为 F1 `-tps` 的前置（fork 的 +5% 是在多级 TP 下测的），(b) 提供一条**不依赖 RCCL/`--ipc=host`** 的通路（强制 one-shot：`GGML_TP_AR_ONESHOT=1`，可用于 RCCL 起不来或 shm 受限的环境）。要判定 tg 上那约 4% 是否真实，需把 `-r` 提到 8 或改测 `-n 256`。
+  - 相关开关：`GGML_ENABLE_CUSTOM_AR=0` 关、`GGML_TP_AR_NO_GATE=1` 关尺寸门限、`GGML_TP_AR_ONESHOT=1` 强制 one-shot、`GGML_TP_AR_TWOSHOT=0/1` 强制模式、`GGML_TP_AR_TWOSHOT_MIN_NE` 改阈值、`GGML_TP_AR_KTIMING` 打印计时。
 
 ## F3 gfx906 内核
 
