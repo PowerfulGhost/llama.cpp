@@ -25,8 +25,10 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
 | F6 | loader `-lm dio` / `-lzm` 策略 | B | 多提交 | 未量化 | 暂不 |
 | F7 | MTP / dspark 投机解码优化 | C | 多提交 | 未量化 | 暂不 |
 | F8 | DeepSeek-V4 专项（topk-moe / hc 融合 / engram） | C | `75db26192` `5542318e7` `5c8b24021` 等 | 与本模型无关 | 不采纳 |
+| F9 | gfx906 权重重排（Q4_K/Q5_1/Q8_0/IQ4_NL/Q5_K） | A/B | `2e9d29fe7` `fcb857560` `b9a990b28` `b8baef09f` `481f684d3` | **本机 +23% prefill / +4% decode**（最大单项） | **下一步主菜**（未开始） |
 
-推荐次序：**F2 → F3 → F1(+F4)**。先把"独立新文件"和接线跑通，再啃 meta 设备的重写。
+推荐次序：**F2（已落）→ F9 → F1(+F4)**。F3 已否决、F3c 判定为"上游已有"。
+F9 是收益最大的单项且对照组在同一 build 内（`-nr 1`）；F1 是最大的重写，放最后。
 
 ---
 
@@ -159,6 +161,27 @@ F32 is both faster and more faithful. Worth **+18-19% prefill on UD / `*_XL` qua
 Automatic, no flag. `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute type.”*
 我们的模型正是 **UD-Q4_K_XL**（UD 量化会保留部分 BF16 张量），且我们自己测到 fork 的 layer 模式 prefill 比上游快 30%+（450 vs 339 @pp512）。
 → 这是目前性价比最高的下一个候选。
+
+## F9 gfx906 权重重排（weight repack）
+
+- **做什么**：Q8_0/IQ4_NL/Q4_K/Q5_K/Q5_1（以及 MXFP4）的权重在**上传时**重排成「quants 与 scales 分平面、行去别名」的布局，
+  gfx906 的 MMQ / mat-vec 内核直接读，省掉 per-block scale gather。走的是上游本来就有的 extra-buffer-type 机制
+  （`--no-repack` / llama-bench `-nr 1` 可关）。
+- **上游状态**：**只有 CPU 侧**（`ggml_backend_cpu_get_extra_buffer_types()` + `make_cpu_buft_list()`，`src/llama-model.cpp:1119`）；
+  GPU 侧没有 → 需要给 `make_gpu_buft_list()` 加 `use_extra_bufts`（fork 已做，`src/llama-model.cpp:1524`）。
+- **实测**（fork `eefc4e732`，8×MI50，`-sm layer`，`-lm dio`，`-r 3`，**同 build 内 `-nr 1` 对照**）：见 baselines §3.3 →
+  **+23% prefill / +4% decode**，是所有候选里最大的一项；关掉 repack 后 fork 只剩 +3%（≈上游水平）。
+- **我们模型的类型分布**：Q4_K 44.6%、IQ4_NL 28.9%（= PLE 表那 1 个张量）、Q5_1 20.4%、Q8_0 5.1%、Q5_K 0.9%
+  —— 全在 fork 的支持集合内。
+- **移植面**：新目录 `ggml/src/ggml-cuda/q8_repack/`（4516 行，**无冲突**）+ 钩子（`ggml-cuda.cu`、`common.cuh`、
+  `CMakeLists.txt`、`src/llama-model.cpp` 的 GPU extra-buft、`ggml-backend-meta.cpp` 的 TP 切片 repack）。
+  内核本身是"纯新文件"，钩子才落在上游重构热点上（`llama-model.cpp` 796/660、`ggml-cuda.cu` 496/1496）。
+- **验收优势**：对照组在**同一个 build 内**（`-nr 1`），不依赖两棵树/两份构建的一致性 —— 正好避开 F3b 踩过的构建污染坑。
+- **增量计划**：① 骨架（CUDA extra-buft 接线 + 上传/重排 infra）+ **Q4_K**（44.6% 的字节）→ ② **Q5_1**（20.4%；fork 文档对
+  "43 个 Q5_1 张量的 Qwen3.8-Flash-Next MoE" 报 +11% prefill，就是本模型）→ ③ Q8_0（503 个张量）→ ④ IQ4_NL / Q5_K →
+  ⑤（可选）MoE up/gate 融合（实测只值 ~2% decode，优先级最低）。每步都用 `-nr 1` 出数字。
+- **数值验收**：K-quant 重排在 fork 文档里是 "byte-identical boots"、PPL 不变，但 greedy 生成可在**浮点重结合**范围内不同
+  → 按"允许 FP 重结合差异、PPL/首 200 token 语义一致"验收，而非 F2 那种逐位一致。
 
 ## F1 多级 TP `-tps`（TP×PP）
 

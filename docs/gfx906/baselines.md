@@ -143,6 +143,37 @@ TP custom AllReduce: auto-selected two-shot for 8-rank decode-sized tensors
 
 > llama-bench 没有 `-c/--ctx-size` 参数（会报 `invalid parameter for argument: -c`），上下文由 `-p`/`-n` 自动推导。
 
+## 3.3 mxxm fork 的 gfx906 权重重排（repack）A/B（2026-10-12）
+
+用 fork 自己的 build（`build-mxxm` = `eefc4e732`），`-sm layer`、`-lm dio`、`-p 512,2048,4096,16384 -n 128 -r 3`，
+**同一次运行内**用 `-nr 1` 关掉 repack 做对照（不受两棵树/两份构建差异影响）：
+
+| 配置 | pp512 | pp2048 | pp4096 | pp16384 | tg128 |
+|---|---|---|---|---|---|
+| fork repack ON（A） | 446.85 | 1131.66 | 1522.31 | 1986.25 | 33.76 |
+| fork repack ON（C，重复） | 445.92 | 1131.61 | 1522.96 | 1998.85 | 34.08 |
+| fork repack OFF（`-nr 1`，B） | 350.38 | 876.65 | 1167.39 | 1530.52 | 32.35 |
+| 上游 master + F2（参照，§2/§3.1） | 339.27 | 853.18 | 1094.92 | 1339.60 | 34.33 |
+
+→ **repack 值 −22~23% prefill、−4.2% decode**（A 与 C 两次一致在 0.5% 内）；关掉后 fork 只比上游快约 3%
+⇒ **fork 的 prefill 优势几乎全部来自权重重排**。
+
+MoE 融合拆分（`GGML_CUDA_REPACK_KQUANT_MOE_FUSION=0`）：pp512 446.17 / pp2048 1131.97 / pp4096 1521.92 / tg128 33.36
+→ prefill 完全不受影响，融合只值约 2% decode。
+
+模型张量类型直方图（`UD-Q4_K_XL`，4 分片，纯 python 解析头部得到）：
+
+| type | 张量数 | GiB | 元素占比 |
+|---|---:|---:|---:|
+| Q4_K | 94 | 41.31 | 44.6% |
+| IQ4_NL | 1 | 26.82 | 28.9% |
+| Q5_1 | 43 | 25.20 | 20.4% |
+| Q8_0 | 503 | 8.95 | 5.1% |
+| Q5_K | 2 | 1.07 | 0.9% |
+| F32 / BF16 | 557 / 24 | 0.29 / 0.04 | ~0% |
+
+（IQ4_NL 那 1 个张量就是 26.8 GiB 的 `per_layer_token_embd.weight`。）
+
 ## 4. 与模型相关的关键事实（供以后判断）
 
 - 权重里约 **27465 MiB（26.8 GiB）是 host-mapped 的 PLE 表**（`per_layer_token_embd.weight`，
@@ -156,7 +187,9 @@ TP custom AllReduce: auto-selected two-shot for 8-rank decode-sized tensors
 
 1. `git fetch upstream && git rebase upstream/master`（见 `README.md`）
 2. 重新配置构建（`-DGGML_HIP=ON -DGPU_TARGETS=gfx906 -DGGML_HIP_RCCL=ON`）
-3. 用上面的容器配方跑 `-sm layer` 与 `-sm tensor`（TP 需 `--ipc=host`）
+3. 用上面的容器配方跑 `-sm layer` 与 `-sm tensor`（TP 需 `--ipc=host`）；
+   模型挂载用**仓库内真实路径** `<repo>/models`，宿主若没有 `/models`，docker 会以 root 静默建一个空目录，
+   然后报 `failed to load model`（本机踩过一次）
 4. 结果写入本页，并**标注 commit hash + 加载模式 + 是否 `--ipc=host`**
 5. 页缓存冷热会显著影响 `pp4096` 与任何 PLE 相关结论：比较不同配置时保持同一缓存状态，
    必要时先 `echo 3 > /proc/sys/vm/drop_caches`（需 sudo，会扰动整机，慎用）
