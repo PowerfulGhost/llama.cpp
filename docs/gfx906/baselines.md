@@ -115,6 +115,21 @@ TP custom AllReduce: auto-selected two-shot for 8-rank decode-sized tensors
 > 会出现“三组全不一致”的假警报；剔除该行后完全一致。
 > 另外，默认 verbosity 会吞掉 `TP custom AllReduce: initialized ...` 这条 INFO，取证时需要给 `llama-cli` 加 `-v`。
 
+## 3.2 F3b chunked gated-delta-net prefill 的 A/B（已回退，2026-10-12）
+
+上游 `f2cc7282c` + F2，仅差 F3b 两个二进制（同一 commit 的父/子），`-sm layer`、`-lm dio`、`-p 512,2048,4096 -n 128 -r 3`：
+
+| 配置 | pp512 | pp2048 | pp4096 | tg128 |
+|---|---:|---:|---:|---:|
+| chunked GDN（`1003238ee`） | 340.50 ± 1.57 | 854.04 ± 6.76 | 1096.56 ± 1.97 | 34.38 ± 0.06 |
+| 串行 GDN（`75cbe92b1`） | 339.23 ± 1.98 | 852.89 ± 7.00 | 1094.90 ± 1.96 | 34.46 ± 0.04 |
+
+结论：**无可测差异（≤0.4%）**，因此回退。（chunk 路径确实被选中：
+`launch_gated_delta_net: DBG n_tokens=512 S_v=128 KDA=0 keep_rs=0 eligible=1`；200-token prompt 下两条路径的**生成 token 不同**，即非 bit-exact。）
+
+> ⚠️ 测量坑（踩了两次）：**llama-bench 默认 verbosity 会吞掉 WARN**。
+> 所有 `GGML_LOG_WARN`（包括自定义诊断打印与 fork 的 `gdn-chunk-snapshots` 公告）都必须加 `-v` 才看得到。
+
 ## 4. 与模型相关的关键事实（供以后判断）
 
 - 权重里约 **27465 MiB（26.8 GiB）是 host-mapped 的 PLE 表**（`per_layer_token_embd.weight`，

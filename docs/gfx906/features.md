@@ -18,7 +18,7 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
 | # | 特性 | 级别 | 来源（fork commit） | 实测/文档收益 | 状态 |
 |---|---|---|---|---|---|
 | F2 | 自定义 AllReduce（PCIe 友好） | A/B | `04f89ab03` `5f65f9fa3` `41c46cedb` `92607b5d1` `19d784ad0` `743037eae` | 本机 A/B 在噪声内；fork 文档 +5%（decode） | **已移植** `75aba2e4e` |
-| F3 | gfx906 内核（MMQ/Q8 repack/gated-delta chunk） | A/B | `2335544ab` `fcb857560` `55b275262` `1248e5e37` `b8baef09f` | 文档 +6~8%（decode） | 未开始 |
+| F3 | gfx906 内核（MMQ/Q8 repack/gated-delta chunk） | A/B | `2335544ab` `fcb857560` `55b275262` `1248e5e37` `b8baef09f` | MMQ 配置**已被上游吸收**；GDN chunk 本模型 0 收益 | **不采纳**（见下） |
 | F1 | 多级 TP `-tps`（TP×PP） | C | `04f89ab03` + 后续 | **本机实测 +8.5% decode**（见 baselines） | 未开始 |
 | F4 | meta/调度流水线修复（依附 F1） | C | `c7069d868` `7f117dcd2` `27e980a21` `46b95d97e` `2d05207b6` `a355590d2` `be8ff98aa` `62d4be47d` `b8efb9510` | 文档 +37% layer prefill 等 | 依赖 F1 |
 | F5 | PLE 分片 `LLAMA_PLE_SHARD` | C | `51b31fc47` | 本机 8 卡 **±2%（不采纳）** | 不采纳 |
@@ -73,6 +73,37 @@ fork 自分叉点以来：**115 个文件、+18455 / −940**；同期上游：1
 - **注意**：fork 整体的 **layer 模式 decode 反而比上游慢 8.8%**（31.31 vs 34.33 t/s），
   说明这些内核**不是无条件收益**，必须逐个 A/B 单独量化，不能整包照搬。
 - **验证**：同一模型、同一 `-lm` 口径，逐内核开关对比；关注 qwen4exp 的 gated-delta 分块 prefill。
+
+### 移植结论（2026-10-12）：两项都不采纳
+
+**F3a MMQ gfx906 配置 —— 已被上游吸收（无需移植）。**
+上游把 VEGA20 归入 GCN（`GGML_CUDA_CC_IS_GCN`：`cc > OFFSET_AMD && cc < CDNA1`，906 < 908），
+所以 gfx906 走 `mmq-config-gcn.cuh`，而它**已经有** Q8_0 / `nthreads=512` / `J` 最高 128 的条目
+（`CASE(GGML_TYPE_Q8_0, 512, 2, 128, 128, ...)`）——正是 fork 新增 `mmq-config-gfx906.cuh` 想做的那件事。
+fork 剩下的只有 J 扫描里的 VEGA20 占用门控（`J > 64` 时要求 tile 总数 ≥ nsm），
+而 gfx906 上只有 Q8_0 会提供 `J > 64`，**本模型（UD-Q4_K_XL）无法验证** → 不采纳。
+
+**F3b chunked gated-delta-net prefill —— 已移植、已验证生效、但回退。**
+- 移植：`gated_delta_net_chunk.{cu,cuh}`（366 行）+ `gated_delta_net.cu` 34 行 hook；编译通过。
+- **确认生效**（临时插桩，需 `-v` 才可见）：`launch_gated_delta_net: DBG n_tokens=512 S_v=128 KDA=0 keep_rs=0 eligible=1`。
+- **A/B（`-sm layer`，`-lm dio`，`-p 512,2048,4096 -n 128 -r 3`）**：
+  | | pp512 | pp2048 | pp4096 | tg128 |
+  |---|---:|---:|---:|---:|
+  | 有 chunk | 340.50 ± 1.57 | 854.04 ± 6.76 | 1096.56 ± 1.97 | 34.38 ± 0.06 |
+  | 无 chunk | 339.23 ± 1.98 | 852.89 ± 7.00 | 1094.90 ± 1.96 | 34.46 ± 0.04 |
+  → 全部在噪声内（≤ 0.4%）。**本模型的 prefill 不是被 GDN 串行扫描主导**（48 层里 MoE 512 experts + 27 GiB host PLE gather 才是）。
+- **token 一致性：不一致**。200-token prompt、贪心 32 token：
+  chunk = `...repeated NATO alphabet sequence...`，serial = `...repeated NATO phonetic alphabet sequence...`。
+  分块改变浮点求和顺序，不是 bug，但**会破坏输出可复现性**（对投机解码接受率/对比测量是麻烦）。
+- 结论：0 收益 + 非 bit-exact → 回退（代码已从 `gfx906-opt` 中移除）。将来若跑 delta-net 为主的模型（如 Qwen3Next）再取。
+
+### 新线索（待评估）：BF16 compute on gfx906（F3c）
+
+fork `FEATURES.md` 有独立一节：*“On AMD parts predating CDNA and RDNA3, BF16 matmuls compute in F32 …
+F32 is both faster and more faithful. Worth **+18-19% prefill on UD / `*_XL` quants that keep BF16 tensors**.
+Automatic, no flag. `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` selects the old compute type.”*
+我们的模型正是 **UD-Q4_K_XL**（UD 量化会保留部分 BF16 张量），且我们自己测到 fork 的 layer 模式 prefill 比上游快 30%+（450 vs 339 @pp512）。
+→ 这是目前性价比最高的下一个候选。
 
 ## F1 多级 TP `-tps`（TP×PP）
 
