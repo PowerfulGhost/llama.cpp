@@ -213,53 +213,52 @@ server 端 prefill 8K 1251 / 32K 1561 t/s，decode 1/2/6 用户 62/78/98 t/s，6
 
 ---
 
-## E9. furnace 采用评估（**已实测；含对首版的更正**）
+## E9. furnace 复现与采用评估（**定稿**，2026-10-13）
 
-`sixvolts/llamacpp-gfx906-furnace` @ `7ba588b8d`（2026-10-11，MIT，17★，单维护者，2026-10-11 仍在更新），
-按它的配方构建：`-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 -DGPU_TARGETS=gfx906 -DGGML_HIP_GRAPHS=ON -DGGML_CUDA_NO_PEER_COPY=ON -DGGML_HIP_RCCL=ON -DLLAMA_CURL=OFF`。
+对象：`sixvolts/llamacpp-gfx906-furnace`（MIT，17★，单维护者）
+- **新版** = `7ba588b8d`（2026-10-11，`gfx906-perf`，含其 README 主打的 "prompt pipeline + kernel round"）
+- **旧版** = `c575827e9`（其上一版默认分支，**没有** sparse prefill attention，**没有** staging；但**已有** repack 与 QSA 池化/打分）
 
-### ⚠️ 首版评估作废的原因
-首版跑 furnace 时**漏了它生产配置里的两个开关**：`GGML_CUDA_REPACK_Q8_0=1` 与 `GGML_CUDA_REPACK_Q5_1=1`
-（在它的树里 Q8_0/Q5_1 的重排是**可选默认关**的，而它的 4 卡成绩是开着的）。补上之后长上下文与 decode 大幅变化：
+构建（两版相同，8 卡与 4 卡都测；RCCL 开/关已验证无影响）：
+`-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 -DGPU_TARGETS=gfx906 -DGGML_HIP_GRAPHS=ON -DGGML_CUDA_NO_PEER_COPY=ON -DLLAMA_CURL=OFF`
+运行环境（**必须**，否则对比不成立）：`GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q5_1=1`
+（在它的树里 Q8_0/Q5_1 重排是**可选默认关**；漏掉会让 pp8192 从 1668 掉到 345）
 
-| 指标 | 漏配置（首版） | **补上配置（正确）** |
-|---|---|---|
-| pp4096 | 686 | **1133.8** |
-| pp8192 | 345 | **1667.7** |
-| tg64/128 | 40.6 | **51.6** |
+### 结果（同机同模型 8×MI50 / UD-Q4_K_XL，`-b 16384 -ub 1024 -fa on -sm layer`，r=2）
 
-因此首版的两条结论一并撤回：① "它的异步输入 staging 在 8 卡上是负优化" —— 补配置后
-`GGML_SCHED_SYNC_INPUTS=1` 与默认**完全无差别**（pp4096 1133.7 vs 1134.8、pp8192 1666.6 vs 1670.6、tg 51.05 vs 51.99），
-那是漏配置造成的假象；② "长上下文退化 2~5 倍" 同样作废。
+| 配置 | pp2048 | pp4096 | pp8192 | tg64 |
+|---|---:|---:|---:|---:|
+| 我们的树（上游+F2+F9） | 950.5（默认 ub 时 1169.6） | 1449.0 | 1791.0 | 34.8 |
+| **furnace 旧版** | 1359.0 | **2064.0** | **2507.7** | 45.3 |
+| furnace 新版 | **1505.3** | 1078.0 | 1616.1 | **51.1** |
+| furnace 旧版（4 卡） | 1360.7 | 2065.5 | 2506.3 | 44.2 |
+| furnace 新版（4 卡） | 1505.3 | 1077.9 | 1615.7 | 50.8 |
 
-### 正确的对比（同机同模型：8×MI50，Qwen3.8-Flash-Next UD-Q4_K_XL，`-lm dio`，`-fa on`，`-sm layer`）
+### 五条结论
 
-| 指标 | **我们**（上游+F2+F9） | **furnace（生产配置）** | 差异 |
-|---|---:|---:|---|
-| pp512 | 451.6 | **815.0** | furnace **+80%** |
-| pp2048 | 1169.6 | **2131.5** | furnace **+82%** |
-| pp4096 | **1472.0** | 1133.8 | 我们 **+30%**（异常点，见下） |
-| pp8192 | 1672.5 | 1667.7 | 打平 |
-| tg128 | 35.2（**MTP 40.8**） | **51.6** | furnace **+47%**（对 MTP 也 +26%） |
-| 单流 server decode | 32.6（MTP 40.8） | **47.0** | furnace +44% |
-| 2 槽 / 4 槽 / 8 槽总吞吐 | 47.5 / 54.9 / 83.1 | **64.1 / 92.6 / 103.8** | furnace +35% / +69% / +25% |
+1. **decode 复现且超过它的宣称**：它 README 说 tg64 49.2 / @32K 深度 43.7；我们实测（旧版）45.3、新版 **51.1**，@32K 深度 46.8 ✅。
+2. **prefill 无法复现，而且方向反了**：它宣称 pipeline 改动把 pp8192 从 877 提到 **1978**；
+   我们的机器上**旧版（没有那些改动）就有 2506**，而**新版只有 1616**。即它这一轮改动在 8 卡/4 卡上都把长上下文 prefill **做掉了一半**。
+3. **退化不是环境问题**：逐个实测它的 14 个开关（`NO_FA_SPARSE_PREFILL`、`NO_QSA_POOL/SCORE`、`QSA_NO_MS_CACHE`、
+   `NO_MOE_SMALL`、`NO_Q8_NC`、`NO_F32_NC`、`NO_Q8_MULTI`、`NO_Q8_EMIT`、`NO_HC_UP_PRE`、`NO_REPACK_FLATTEN`、`GDN_CPW`、`SCHED_SYNC_INPUTS`）
+   → pp4096 恒在 1070~1078、pp8192 恒在 1603~1618；RCCL 开/关也无差别（1076 vs 1078）。
+   输出正确性已核对（旧/新版同一 prompt 生成内容几乎一致）⇒ 是**真退化**，不是少算。
+   文件级差异指向它重写的内核区：`repack-gcn.cu` +2544 行（4329→6513）、`ggml-cuda.cu` +366、`ssm-conv.cu` +335、`norm.cu` +333、
+   `topk-moe.cu` +142、`top-k.cu` +138；新增 `qsa-mask.{cu,cuh}`。
+4. **关键结论：layer split 的卡数与吞吐无关。** 4 卡与 8 卡的数字**精确相同**（2065.5 vs 2065.4、2506.3 vs 2505.9、1360.7 vs 1359.0），
+   因为一次 forward 的 48 层必须串行穿过各 stage，加卡只是把"每卡 12 层"变成"每卡 6 层"，**串行链总计算量不变**。
+   ⇒ **8 卡在这个配置下买的是容量（装下 104 GiB 模型 + 长上下文 KV），不是吞吐。** 要把卡变成吞吐只有三条路：
+   TP（E3 已证窄切片对专家 GEMM 是灾难）、TP×PP 混合（`-tps`）、或**真正的 micro-batch 流水线调度**（llama.cpp 没有；vLLM 的 PP 天生带）。
+5. **它旧版也存在风险**：其 README 的 correctness 条目说明"GDN state read 与 cache write-back 的 race"是在**这一轮**修掉的
+   ⇒ 旧版在多序列共享 prompt ubatch 时可能不可复现（未验证，采用前必须测）。
 
-（furnace 服务端跑它的生产风格配置：`-np 8 -c 32768 -b 16384 -ub 1024`；我们跑 `-np 8 -c 32768`，两者都短 prompt + `ignore_eos`。）
+### 修订建议
 
-**遗留异常**：furnace 自己的曲线是 pp512 815 → pp2048 2132 → **pp4096 1134** → pp8192 1667，
-2048→4096 掉 47%，8192 又涨回来，**非单调**。需要单独复测（隔离每个 prompt 尺寸、清页缓存）确认是它的真实行为还是测量假象。
-
-### 修订后的结论
-
-1. **furnace 现在是基座首选**（原本"不整体采用"的结论作废）：除 pp4096 一个点外，它在 prefill、decode、多槽并发上全面领先，
-   而且它还有 MTP + adaptive draft slots + 多槽 decode 路径。
-2. **切换前必须做的三件验证**（我们的 `acceptance.sh` 正好就是干这个的）：
-   ① 复测 pp4096 异常；② 在 furnace 上跑我们的验收套件（重排 A/B、token 一致性、宽度 1 的 PPL 基线、8 卡是否都用重排 buffer）；
-   ③ 核对它的 `GGML_CUDA_REPACK` 语义与我们 `--repack` 的差异（它是 env + 可选类型，我们是 `--repack` + 默认 3 类型）。
-3. **采用方式**：直接以 `gfx906-perf` 为工作分支（它的提交习惯是跟上上游 merge，不适用我们的 rebase 风格）；
-   我们的 `gfx906-opt`（干净上游 + F2/F9）保留为**对照基线**。
-4. **我们的资产没白做**：① 验收套件/测量方法学正是接纳一个新基座所需要的；② 本次"漏配置导致错误对比"的教训也已记录；
-   ③ F9 的重排实现与 furnace 的重排是同一思路的两个独立实现，可交叉验证（我们 Q4_K+Q5_1+Q8_0 = +34%，它 = +65~383%，差别在 canonical 路径的效率）。
+- **最佳已知基座是 furnace 旧版**：prefill 比我们快 1.4~1.7×，decode 快 ~29%；但如果要做多槽位服务，必须先确认第 5 条风险。
+- **最有价值的下一步是定位新版那 2× 的 prefill 退化**（在 `repack-gcn.cu` / `ssm-conv.cu` / `norm.cu` / `topk-moe.cu` 这一批重写内核里），
+  定位成功就能同时拿到 2506 的 prefill 和 51 的 decode。方法：把它的历史拉全，在旧版之后的"kernel round"提交上二分（每个点约 12 分钟构建 + 2 分钟实测）。
+- **同时应把结论反馈给维护者**：他们 README 的头号卖点（pipeline 877→1978）在我们这无法复现，反而相对其旧版退化一半；这是一个可复现的 issue，附上本页表格即可。
+- 我们的资产在此依然关键：`acceptance.sh` + 本页的复现纪律（先对齐环境变量、再逐开关排除、再验证输出正确性、最后才下结论）。
 
 ## E10. MTP 实测（**我们自己的树就支持**，上游已合 qwen4exp NextN/MTP）
 
