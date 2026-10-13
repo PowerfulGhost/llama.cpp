@@ -120,7 +120,8 @@ git config rebase.autostash true    # 有杂项改动时自动 stash
 |---|---|
 | `llama.cpp` (本仓库) | `gfx906-opt` 工作树 |
 | `../base`（可选） | 纯净上游基线工作树：`git worktree add --detach ../base upstream/master` |
-| `../mxxm-master` | mxxm fork 的 detached worktree（取材用，`git worktree remove mxxm-master` 可清理） |
-| `../build-tp` | 官方代码的 gfx906+HIP+RCCL 构建 |
-| `../build-mxxm` | mxxm fork 的构建 |
+| `../builds/tp` | 本仓库（官方代码 + 本项目 patch）的 gfx906+HIP+RCCL 构建 |
+| `../builds/furnace`、`../builds/furnace-old` | 社区 fork `sixvolts/llamacpp-gfx906-furnace` 新版 / 旧版的构建 |
+| `../forks/furnace`、`../forks/furnace-old` | 上述 fork 的源码（新版 `7ba588b8d`、旧版 `c575827e9`） |
 | `../KNOWLEDGE.md` | 项目知识库（性能/负面结论），与本目录互为补充 |
+| `../archive/2026-10-13-cleanup` | 一次性实验的日志/脚本归档；原文材可直接 `git show archive/mxxm-fork-base:<path>` 取 |

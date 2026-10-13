@@ -3,7 +3,7 @@
 #
 # docker run --rm --ipc=host -w /build/bin \
 #   --device=/dev/kfd --device=/dev/dri --group-add video --group-add 993 \
-#   -v $PWD/build-tp:/build:ro -v $PWD/models:/models:ro \
+#   -v $PWD/builds/tp:/build:ro -v $PWD/models:/models:ro \
 #   -v $PWD/llama.cpp/docs/gfx906/scripts/f2-custom-ar-ab.sh:/ab.sh:ro \
 #   --entrypoint bash qwen-flash-llama-builder:v1 /ab.sh
 set -u

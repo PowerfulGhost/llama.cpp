@@ -2,7 +2,7 @@
 # 验收套件：每次上游 rebase / 改动之后跑一遍，判断是否可接受。
 # 用法（宿主）：
 #   docker run --rm --ipc=host --device=/dev/kfd --device=/dev/dri --group-add video --group-add 993 \
-#     -v $PWD/llama.cpp:/src -v $PWD/build-tp:/build -v $PWD/models:/models:ro \
+#     -v $PWD/llama.cpp:/src -v $PWD/builds/tp:/build -v $PWD/models:/models:ro \
 #     --entrypoint bash qwen-flash-llama-builder:v1 -lc 'bash /src/docs/gfx906/scripts/acceptance.sh'
 set -u
 export LD_LIBRARY_PATH=/build/bin:/opt/rocm/lib

@@ -292,6 +292,8 @@ git log --oneline --diff-filter=A mxxm/master -- <path>
 # 对照 fork 自分叉点以来的全部改动
 git diff 0f3a71be1 mxxm/master -- <path>
 
-# 在本机直接读代码（detached worktree）
-ls ../mxxm-master/<path>
+# 在本机直接读代码（fork 快照的源码已归档，用 tag 取）
+git show archive/mxxm-fork-base:<path>            # mxxm fork
+# furnace：相关文件可直接读源码树
+ls ../forks/furnace/ggml/src/ggml-cuda/<file>
 ```

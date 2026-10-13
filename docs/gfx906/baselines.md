@@ -18,7 +18,7 @@
 ```bash
 docker run --rm --ipc=host -w /build/bin \
   --device=/dev/kfd --device=/dev/dri --group-add video --group-add 993 \
-  -v $PWD/build-tp:/build:ro \
+  -v $PWD/builds/tp:/build:ro \
   -v $PWD/models:/models:ro \
   --entrypoint bash qwen-flash-llama-builder:v1 -lc '
     export LD_LIBRARY_PATH=/build/bin:/opt/rocm/lib
