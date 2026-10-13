@@ -1,54 +1,41 @@
-# gfx906 实验记录（2026-10-12 会话）
+# gfx906 实验记录（2026-10-13 会话，含对 10-12 会话 E1 的更正）
 
-> **目标声明（用户 2026-10-12 明确）**：目标是**改造推理引擎**，让 `Qwen3.8-Flash-Next`(qwen4exp) 在
-> 本机（8×MI50 gfx906，纯 PCIe，ROCm 7.14）上跑出好效率；不是"在现有引擎上挑一套好参数"。
-> **有决心改代码**，必要时甚至换引擎（如 vLLM）并移植 kernel。
-> 因此本页的实验都以"**该改哪条执行路径 / 哪个 kernel**"为导向，而不是"选哪组参数"。
+> **目标声明（用户明确）**：目标是**改造推理引擎**，让 `Qwen3.8-Flash-Next`(qwen4exp) 在本机
+> （8×MI50 gfx906，纯 PCIe，ROCm 7.14）上跑出好效率；**不是"在现有引擎上挑一套好参数"**。
+> **有决心改代码**，必要时换引擎（如 vLLM）并移植 kernel。
+> 因此本页的实验都以"**该改哪条执行路径 / 哪个 kernel**"为导向。
 
 环境与基线见 `baselines.md`；分支/同步流程见 `README.md`；特性清单见 `features.md`。
-模型：`UD-Q4_K_XL`（103.68 GiB，Q4_K 44.6% / IQ4_NL 28.9%（PLE 表）/ Q5_1 20.4% / Q8_0 5.1% / Q5_K 0.9%），
-48 层中 36 层带 SSM/GDN，MoE 512 专家（~10 激活），`n_head_kv=2`。
+模型：`UD-Q4_K_XL`（103.68 GiB）；48 层中 36 层是 SSM/GDN，12 层带 attention；MoE 512 专家、每 token 激活 10 个。
+关键张量形状（GGUF 实测，ggml 约定 ne[0]=输入维、ne[1]=输出维）：
+`attn_qkv`[2560×10240] Q8_0、`attn_gate`[2560×6144] Q8_0、`ssm_out`[6144×2560] Q8_0、
+`ffn_gate_exps`/`ffn_up_exps`[2560×640×512] **Q4_K**、`ffn_down_exps`[640×2560×512] **Q5_1**、
+`ffn_*_shexp`[2560×640] Q8_0、`ffn_gate_inp`[2560×512] F32、`token_embd`/`output`[2560×248320] Q8_0。
 
 ---
 
-## E1. decode 的批量宽度扫描（PP8 / PP8+融合 / TP8）
+## 0. 方法学更正：llama-bench **不能**做批量 decode（E1 作废）
 
-**目的**：多流并发与投机推理的每个 forward 宽度 = 并发槽位数 ×（1+草稿深度）；`llama-bench -b B` 正是
-"一个 forward 处理 B 个 token"，所以在同一宽度上比较就等于在该并发度上比较（维度对齐）。
-命令：`-lm dio -ngl 99 -fa on -ctk f16 -ctv f16 -p 16 -n 128 -r 3 -b B -ub B -o md`。
+10-12 会话的 E1 用 `llama-bench -b {1..32}` 扫描"decode 宽度"，得到"吞吐对宽度是平的（35 t/s）"，
+并据此推断"批处理无收益、投机解码必亏"。**这个结论作废**，原因在源码里：
 
-| 宽度 B | PP8 | PP8+融合 | TP8 |
-|---:|---:|---:|---:|
-| 1 | 35.01 ±0.20 | （未测） | 34.14 ±3.25 |
-| 2 | 35.41 ±0.02 | **36.63 ±0.02** | 34.12 ±3.34 |
-| 4 | 35.30 ±0.09 | **36.60 ±0.05** | 34.14 ±3.28 |
-| 8 | 35.11 ±0.29 | **36.39 ±0.30** | 34.21 ±3.34 |
-| 16 | 35.24 ±0.04 | **36.55** | 33.48 |
-| 32 | 35.56 | **36.30** | 33.95 |
+```cpp
+// tools/llama-bench/llama-bench.cpp : test_gen()
+for (int i = 0; i < n_gen; i++) {
+    batch.clear();
+    batch.add(token, pos++, 0, true);        // ← 永远一次一个 token
+    llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+```
 
-**结论**
-
-1. **PP8 的吞吐对宽度是平的（35.0 → 35.6）**：每个 forward 的耗时**线性正比于宽度**，批处理**没有任何摊薄**。
-   推论：本机的 decode 总吞吐被钉在 **≈35–36 t/s，与并发槽位数无关**——多流并发只能提高单请求的占用比，
-   不能提高整机吞吐。这条直接否掉了"靠批处理/调度改进拿 decode 收益"的路线。
-2. **推测其瓶颈是"每 token 的专家权重读取"**：MoE 每 token 选 ~10 个专家，不同 token 选不同专家，
-   所以权重流量 ∝ token 数（不像 dense 权重那样可被 batch 摊薄）。
-   ⚠️ **这是假设，未证实**——必须由 E4 坐实。
-3. **推论（重要）：投机解码在本机上大概率是净亏**。若宽度 4 的 verify 步耗时 ≈ 4× 宽度 1 的步耗时
-   （E1 实测就是线性的），而 4 宽只提交 ~3 个 token（3 中 3），则有效吞吐 ≈ 3/0.113 s ≈ 26 t/s < 35 t/s。
-   只有验收率极高（或 verify 步亚线性）才划算。**在投入 MTP/draft 之前必须先测 verify 步的宽度成本。**
-4. **TP8 在所有宽度上都不优于 PP8**（34.1 对 35.0 @b=1；33.5–34.0 对 35.1–35.6 @b=16/32），
-   且方差大（±3.3，RCCL 初始化）。⇒ 即便将来补上 TP+repack，decode 侧也没有翻盘空间
-   （repack 本身是 prefill 优化，decode 只值 1~3%）。**TP 的唯一价值仍在短宽度 prefill。**
-5. **融合在宽度 ≥2 时值 +3.5~4%**（36.3–36.6 对 35.1–35.4），而 E2 证明该宽度区间**逐位一致** ⇒
-   **多流/投机场景可以零数值代价打开融合**（`GGML_CUDA_REPACK_MMV_FUSION=1`）。
+`test_gen` 每次只喂 1 个 token，`-b/-ub` 只影响 **prefill**（`test_prompt`）。所以 E1 的 6 行数据其实是
+同一个 1-token decode 用 6 种 prefill 批量测出来的。
+**要测 decode 宽度，只能用 `llama-server -np N` + 并发请求**（见 E5）。
 
 ---
 
-## E2. 融合核在宽度 ≥2 时是否逐位一致（llama-perplexity）
+## E2. 融合核在宽度 ≥2 时逐位一致（llama-perplexity，有效）
 
-**目的**：决定"融合默认关"这个策略在多流场景下是否还需要。
-命令：`llama-perplexity -f corpus-perplexity.txt -c 512 --chunks 2 -b B`，对照 `GGML_CUDA_REPACK_MMV_FUSION`。
+命令：`llama-perplexity -f corpus -c 512 --chunks 2 -b B`，对照 `GGML_CUDA_REPACK_MMV_FUSION`。
 
 | 宽度 | 融合 ON | 融合 OFF | 判定 |
 |---:|---|---|---|
@@ -56,66 +43,156 @@
 | 2 | 3.5886 ±0.36072 | **3.5886 ±0.36072** | **逐位一致** ✅ |
 | 4 | 3.5793 ±0.35953 | **3.5793 ±0.35953** | **逐位一致** ✅ |
 
-**结论**：宽度 2 与 4 时连误差棒都完全相同 ⇒ 每个 chunk 的 loss 相同 ⇒ forward **逐位一致**；
-只有宽度 1 因归约顺序不同而分叉。**多流并发（槽位≥2）或投机验证（宽度≥2）时融合零代价**
-（`features.md` 里"默认关"的理由只对单流宽度 1 成立）。
+**结论**：宽度 ≥2 时连误差棒都相同 ⇒ 每个 chunk 的 loss 相同 ⇒ forward 逐位一致；只有宽度 1 因归约顺序不同而分叉。
+⇒ **多流并发（槽位≥2）或投机验证（宽度≥2）时融合零数值代价**，值 +3.5~4%（E5 表里的"融合 ON"列就是它）。
 
 ---
 
-## 已定论（本轮讨论中算清，不必重测）
+## E3. MoE 专家 GEMM 的形状效率（`test-backend-ops perf -o MUL_MAT_ID`）
 
-1. **TP 的集合通信无法被计算掩盖，而且掩盖了也翻不了盘。**
-   - llama.cpp 的 meta 后端执行是"每子图：8 卡并发算 → AllReduce（host 发起，屏障）→ 下一子图"
-     （`ggml-backend-meta.cpp` 主循环），通信在关键路径上，零重叠。
-   - TP 的通信/计算比 ρ 与序列长度**无关**（两者都 ∝ token 数）⇒ 这就是 TP8 prefill 平线（721/691/693）的成因；
-     PP 的 ρ 小 1~2 个数量级（每层 96 次集合通信 vs 每 forward 7 次边界传递）⇒ 它能吃下"序列变长"的 GEMM 效率红利（452→1162→1468）。
-   - 定量上界（pp4096，fork 实测 TP8+repack 692.8 t/s = 5.91 s/趟；通信估算 ≈1.2 s/趟）：
-     **即使通信 100% 被掩盖 → 4.7 s ≈ 871 t/s，仍 < PP8+repack 的 1468 t/s（2.79 s）**。
-     结论：TP 的劣势不只是通信，还叠加每层多次子图下发/同步、per-card GEMM 变窄、GQA 头数少（`n_head_kv=2`）导致的注意力并行度浪费。
-2. **专家并行（EP）在 8 卡上价值为负。**
-   - EP 与 TP 的**计算量、显存、每卡权重读取量完全相同**（TP 每卡算"被选中专家的 1/8 切片"，EP 每卡算"自己那 1/8 专家的整张"）。
-   - 通信：TP = 2×AllReduce ≈ **49 KB**/token/层（d=6144，f32）；EP = dispatch+combine ≈ 2×(去重 rank 数 7~8)×d×2B ≈ **184 KB**（bf16）
-     ⇒ **EP 是 TP 的 ~3.7 倍**（k=10、8 卡是最差比例；EP 只在 rank≫k 时才有优势）。
-   - EP 唯一的潜在收益是"保住专家 GEMM 的完整形状"（我们专家 ne0=2560，TP 切 8 份后 N≈192 偏窄）→ **交给 E3 判定**。
-   - llama.cpp 没有 EP（只有 none/layer/row/tensor），实现等于从零造 all-to-all dispatch/combine + 专家分区 + 负载均衡。
-3. **repack 在 `-sm tensor` 下用不了**：TP 走 meta 虚拟设备，而 `ggml_backend_meta_device()` 造出来的设备 `reg = nullptr`
-   （无 backend registry）⇒ `make_gpu_buft_list` 的 extra-buft 通道根本不存在；加之重排布局**依赖完整 ne1、不可切分**，
-   必须"每 lane 各自重排切片"并绕过 meta 的分块上传。fork 用 ~188 行 `ggml-backend-meta.cpp` 解决。
-   实测：layer 模式 8 行 `Repacked model buffer size`，tensor 模式 0 行、权重落 `Meta()`。
-4. **PP8 + repack 是当前结构性最优**（pp16384 +30.4%、pp65536 +22.5%、pp4096 +34%、decode +3~6%）。
+本模型真实形状：512 专家、每 token 10 激活、Q4_K gate/up（k=2560）、Q5_1 down（k=640）。
+"完整宽度"= layer 模式（我们现在跑的），"1/8 切片"= TP8 下每卡的形状。单卡、GPU 空闲。
 
----
+| 算子 | ntok | 完整宽度（m=640 / 2560） | 1/8 切片（m=80 / 320） | 切片 wall 比 |
+|---|---:|---|---|---:|
+| Q4_K gate/up | 1 | 49.8 µs / 0.658 TF | 195.8 µs / 0.021 TF | **3.9× 慢** |
+| Q4_K gate/up | 8 | 225.6 µs / 1.160 TF | 226.4 µs / 0.145 TF | 1.0× |
+| Q4_K gate/up | 512 | 10653 µs / 1.570 TF | 4908 µs / 0.427 TF | 0.5× |
+| Q4_K gate/up | 2048 | 11828 µs / **5.670 TF** | 5805 µs / 1.450 TF | 0.5× |
+| Q5_1 down | 1 | 71.2 µs / 0.460 TF | 196.6 µs / 0.021 TF | 2.8× 慢 |
+| Q5_1 down | 2048 | 11363 µs / **5.910 TF** | 2853 µs / 2.940 TF | 0.3× |
 
-## 待做实验（下次会话按此顺序）
+**结论**
+1. **decode 宽度（ntok 小）下，TP 切片对专家 GEMM 是灾难**：1/8 的工作量却要 2.8~3.9× 的时间
+   （per-FLOP 差 20~30 倍）。这从"专家 GEMM 形状"角度**支持 EP/PP（保持完整宽度），不支持 TP**——
+   与 `features.md` 里"EP 通信是 TP 的 3.7 倍"合起来看：TP 在 decode 侧被两头夹击。
+2. **prefill 宽度下切片反而 wall-clock 更快**（因为只做 1/8 的工作，1.45~2.94 TFLOPS 的绝对效率虽低，但每卡工作量也低）。
+3. **最刺眼的一点：即使完整宽度，专家 GEMM 也只跑到 5.7~5.9 TFLOPS ≈ 单卡 int8 峰值（MI50 约 53 TOPS）的 11%**。
+   这是 prefill 的主瓶颈（见 E4b）。
 
-| # | 实验 | 怎么做 | 能得出的结论 | 为什么这个测量能支撑该结论 |
-|---|---|---|---|---|
-| **E4** | **时间归因 / 屋顶线**（最高优先） | ① `-p` 分段曲线看拐点；② rocprof 采样 1~2 个 case 看 kernel 占比；③ 消融（关 PLE、改 n_expert_used、改 `-b`） | decode 35 t/s 与 pp65536 掉到 1410 各自被什么限制（MoE 专家权重读取 / PLE host 表 / SSM-GDN 串行算子 / attention） | 只有知道时间归属，才能决定"改哪个 kernel / 哪条执行路径"。这是唯一可能推翻 E1 那条假设的测量 |
-| **E3** | MoE GEMM 形状效率（EP 的动机） | `test-backend-ops perf -o MUL_MAT_ID`，加探针用例比较 N=1536 与 N=192 | 形状损失幅度；与已知的通信差（3.7×）直接对比 | EP 与 TP 除"形状"和"通信"外全部相同；若形状损失 <10%，EP 收益上限远小于其通信代价 ⇒ 直接否决 |
-| **E5** | 真并发压测（生产等价） | `llama-server -np 8`（PP8/TP8 各一轮）+ 8 路并发客户端，量总吞吐/TTFT/TPOT；长上下文探 KV 容量边界 | 多流场景最终配置 + KV 容量账（TP 在 `n_head_kv=2` 时 KV 可能被复制） | E1 的 `-b` 只模拟宽度，不模拟"多序列 KV 分散访问 + prefill/decode 交错调度" |
-| **E7** | 引擎选型可行性 | 查 vLLM 对 gfx906 的支持面（无 MFMA）+ 该架构是否在模型库；评估"移植 kernel vs 改 llama.cpp"的工程量 | 要不要换引擎 / 换哪条路 | 模型是混合 GDN + 512 专家 MoE + hash 式 PLE 表，属非主流架构；gfx906 无矩阵核，两边都要自研 kernel |
-| **E6** | 验收套件脚本化（工程卫生） | 一条命令跑完：构建 → repack A/B（`--repack 0`）→ token 一致性 → F2 一致性 → 与基线表对比 | 把每次上游 rebase 的验收压到"一条命令 + 30 分钟机器时间" | 让"同步成本"可被持续验证，而不是靠估计（当前估计：2~4 个小 hunk，见 README） |
+（探针已从 `tests/` 移除，副本：仓库外 `probe-e3-e4.cpp.txt`，共 15 行，可直接贴回 `make_test_cases_perf()` 的 GATED_DELTA_NET 段之后。）
 
 ---
 
-## 测量卫生（本轮新增的坑）
+## E4a. decode 的时间归因（rocprofv3 kernel trace，PP8）
 
-- `llama-bench` 的关 repack 开关是 **`--repack 0`**；它**不接受** `-nr`/`--no-repack`（那是 llama-cli/server 通用参数），
-  也**不认** `LLAMA_ARG_REPACK` 环境变量。
-- `llama-bench` 默认吞掉 `GGML_LOG_WARN`：要看 witness/`Repacked model buffer size` 必须加 `-v`。
-- `llama-perplexity` 的 PPL **随 `-b` 变化**（b=1 约 3.59 / b=2 约 3.59 / b=512 约 3.77），
-  所以 on/off 对照**必须在同一个 `-b` 下**比较；误差棒相同即逐位一致。
-- 融合的 witness：`[repack-moe-fusion] type=q4_K cols=1 fused up/gate mat-vec engaged`。
-- 重构仓库后必须抽查一个已知有差异的 shape（如 `test-backend-ops perf -o GATED_DELTA_NET` 的 H=32/tok=512），
-  避免再次出现"用错树构建"导致的假结果（F3b 期间踩过）。
+做法：`rocprofv3 --kernel-trace` 采一次 `llama-bench -p 0 -n 8`，按"最大时间间隔"切出工作负载窗口，
+按 kernel 名字归类（窗口内 36091 次 dispatch，GPU 忙时 307 ms）。
+⚠️ 绝对毫秒含 profiler 开销与预热，只看**相对占比**。
+
+| 类别 | 占比 |
+|---|---:|
+| 稠密 Q8_0 mat-vec（`mul_mat_vec_q8_0_repacked`，即 attention/SSM 的 Q8_0 投影） | **31.3%** |
+| 其它（`dsv4_hc_pre/post`、`unary_gated_op`(silu)、`concat` …） | 12.8% |
+| 逐元素（`scale_f32`/`k_bin_bcast`/sigmoid…） | 11.9% |
+| 稠密 mat-vec f16/f32（`mul_mat_vec_f`） | 10.8% |
+| 激活量化 `quantize_q8_1` | 8.0% |
+| MoE mat-vec（Q4_K，`mul_mat_vec_rp<12,…>`） | 6.8% |
+| `rms_norm_f32` | 4.0% |
+| 拷贝 | 3.3% |
+| MoE mat-vec（Q5_1） | 3.5% |
+| MoE 路由 `topk_moe` | 2.9% |
+| GET_ROWS（PLE 表 gather） | 2.6% |
+| SSM/GDN | 1.9% |
+| Flash-Attention | 0.9% |
+
+**结论**：decode 是 **GPU 忙满**的（GPU 忙时 ≈ 墙钟时间），但时间花在**普通稠密 mat-vec（42%）+ 各种零碎逐元素/量化/归一化/拷贝（约 27%）**上，
+**不是**花在这个模型的"异形结构"（PLE 2.6%、SSM/GDN 1.9%、FA 0.9%）。
+⇒ decode 侧的引擎改造方向是"**减少 kernel 数量 + 提高稠密 mat-vec 效率**"（融合、更少的小 kernel），
+而不是去优化 PLE/SSM。
+
+## E4b. prefill 的归因（op 微基准重建）
+
+用 E3 的单卡微基准，把 48 层 × 3 个专家 GEMM 加起来：
+`48 × (11828 + 11828 + 11363) µs ≈ 1.68 s`（ntok=2048），外推到 4096 token ≈ 3.3 s。
+实测 pp4096 一趟 = 2.79~3.03 s（1468~1351 t/s）。**两者同量级 ⇒ prefill 基本由 MoE 专家 GEMM 决定**，
+且它只有 11% 的峰值效率（E3 结论 3）。
+
+**结论**：prefill 的最大杠杆是**专家 GEMM 的绝对效率**（skinny per-expert GEMM：M=640、N≈40、K=2560）。
+这是一条**明确的 kernel/算法级改造方向**（grouped-GEMM / 更好的分块与并行度、或者改数据结构让每专家 N 变大）。
+次要方向：pipeline 串行化问题（layer 模式是否让 8 张卡串行工作，见"未解决"一节）。
 
 ---
 
-## 本轮的状态快照
+## E5. 真并发压测（`llama-server -np 8` + N 路并发请求）
 
-- 分支 `gfx906-opt`（相对 `upstream/master` = `f2cc7282c`）：代码 patch 只有 **F2**（自定义 AllReduce）
-  和 **F9**（gfx906 权重重排 + MoE/稠密融合接线），热点文件 +284 行，其余是新目录 `q8_repack/`(4516 行) 与 `tp-allreduce.*`。
-  **未推送**（rebase 过，将来要推需 `--force-with-lease`）。
-- 当前最佳配置：`-sm layer`（PP8）+ repack（默认开）+ 多流场景下 `GGML_CUDA_REPACK_MMV_FUSION=1`。
-  实测：pp512 451.6 / pp2048 1161.7 / pp4096 1467.7 / pp16384 1739.6 / pp65536 1410.7 / tg128 35.6–36.6。
-- 对照（上游 master + F2）：339.3 / 853.2 / 1094.9 / 1339.6 / 1150.0 / 34.3。
+这是**唯一有效的 decode 宽度实验**（E1 作废后）。每请求 `n_predict=128, ignore_eos=true`，短 prompt（11 token）。
+`-c 32768 -np 8`，PP8 与 TP8（无 repack，因为 TP 下 repack 未接线）各一轮。
+
+| 并发 | PP8 总吞吐 | PP8 单请求 | TP8 总吞吐 | TP8 单请求 |
+|---:|---:|---:|---:|---:|
+| 1 | 32.6 | 32.6 | 27.4 | 27.4 |
+| 2 | 47.5 (1.46×) | 23.8 | 36.6 (1.34×) | 18.3 |
+| 4 | 54.9 (1.68×) | 13.7 | 49.3 (1.80×) | 12.3 |
+| 8 | **83.1 (2.55×)** | 10.4 | 81.4 (2.97×) | 10.2 |
+
+**结论**
+1. **并发确实提升总吞吐**（PP8 32.6 → 83.1 t/s，2.55×），彻底推翻 E1 的"批处理无收益"。单请求延迟也随并发上升（3.9 s → 12.3 s 完成 8 个请求）。
+2. **PP8 ≥ TP8 在所有并发度**（8 路时 83.1 vs 81.4，差 2%）⇒ 即使目标场景是多流并发，layer 模式仍是（至少并列）最优。
+3. 亚线性（8 路只有 2.55×，理想 8×）⇒ decode 仍是访存主导，仍有优化空间；结合 E4a，"减少零碎 kernel"是主要方向。
+4. 多流场景下**建议开融合**（E2 证明宽度 ≥2 逐位一致，值 +3.5~4%）。
+5. 投机解码的账要重算：宽度 8 时每 token 成本 ≈ 12 ms，而宽度 1 是 39 ms ⇒ verify 步不是线性成本，
+   **投机大概率是正收益**（之前基于 E1 的"净亏"推断随之作废）。
+
+---
+
+## E7. 引擎选型：vLLM 是不是选项
+
+- **模型侧：vLLM 有**。`vllm/model_executor/models/qwen3_next.py` 实现了 Qwen3-Next 的
+  `Qwen3NextSparseMoeBlock`；GDN 层已抽成共享的 `GatedDeltaNetAttention`（PR #37975）；官方博客/Recipes 有 Qwen3-Next 支持与 MTP。
+- **硬件侧：明确不支持 gfx906**。
+  - vLLM issue #22458（"Please add support for AMD Instinct MI50"，2025-08）→ **closed as not planned**；
+  - PR #33811 专门加注释说明 gfx906(MI50/MI60) 不被支持（op 里说明即便列在 HIP 架构里也跑不起来）；
+  - MI50 自 ROCm 6.0 起被 deprecated；vLLM 要求 ROCm 6.3+；
+  - PR #12431（"add support for AMD MI25/50/60"）亦被关闭。
+- **结论**：换 vLLM = fork vLLM + 把它的 Triton/量化 kernel 移植到 gfx906（Triton 无 gfx906 后端）+ 适配新架构变体，
+  是**数月级、且收益未证**的工程。**llama.cpp 仍是基座**，优化应针对 E3/E4 测出的瓶颈（专家 GEMM 效率、decode 的零碎 kernel）。
+
+---
+
+## E6. 验收套件（已落地）
+
+`docs/gfx906/scripts/acceptance.sh`：一条命令跑完
+① 构建 → ② repack A/B（对照 `--repack 0`，带阈值判定）→ ③ 融合宽度 1 应有差异 + 宽度 1 的 PPL 基线
+→ ④ 8 卡是否都用了 repack buffer → 输出 PASS/FAIL 汇总。
+每次上游 rebase 后跑它，把验收从"半天"压到"一条命令 + ~30 分钟机器时间"。
+
+---
+
+## 已定论（本轮之前算清，不必重测）
+
+1. **TP 的集合通信无法被计算掩盖，而且掩盖了也翻不了盘**：meta 后端是"每子图 8 卡并发算 → AllReduce（host 发起，屏障）→ 下一子图"；
+   TP 的通信/计算比与序列长度无关（两者都 ∝ token 数）⇒ TP8 prefill 平线；即使把 1.2 s 通信全藏掉，
+   pp4096 也只能到 ~871 t/s，仍低于 PP8+repack 的 1468 t/s。
+2. **EP 在 8 卡上通信是 TP 的 ~3.7 倍**（49 KB vs 184 KB / token / 层，k=10）；计算量、显存、每卡权重读取量与 TP 相同。
+   叠加 E3 的结论（完整宽度 vs 切片），**在 decode 侧 EP 才真正有意义**，但 8 卡 + 纯 PCIe 上仍不建议（llama.cpp 也没有 EP，要从零造）。
+3. **repack 在 `-sm tensor` 下用不了**：meta 虚拟设备 `reg = nullptr`（extra-buft 通道不存在）+ 重排布局依赖完整 `ne1`、不可切分。
+   fork 用 ~188 行 `ggml-backend-meta.cpp` 解决，未移植。
+4. **PP8 + repack 是当前结构性最优**：pp512 451.6 / pp2048 1161.7 / pp4096 1467.7 / pp16384 1739.6 / pp65536 1410.7 / tg128 35.3
+   （对照上游 master + F2：339.3 / 853.2 / 1094.9 / 1339.6 / 1150.0 / 34.3）。
+
+---
+
+## 未解决 / 下一步
+
+| # | 待办 | 为什么重要 | 建议做法 |
+|---|---|---|---|
+| **N1** | layer 模式的 8 张卡是否被**串行化**（prefill 时是否只有 1 张卡在算） | 若成立，是比 kernel 优化更大的杠杆（理论上最多 ~8×）；E4b 的"微基准之和 ≈ 整趟时间"支持这一猜测，但 rocm-smi/amd-smi 采样不可靠、`--device` 在本 build 上加载失败，**未证实** | 用 `rocprofv3` 的 `--kernel-trace` 看不同 Agent 的时间区间是否重叠；或在 sched 层加计时打点 |
+| **N2** | 专家 GEMM 为什么只有 11% 峰值效率 | prefill 的第一瓶颈（E4b） | 用 rocprof 采样 `mmq_gemm_repacked` / `mul_mat_vec_rp` 的 occupancy/带宽；试不同 tiling、或改用"按专家分组的一次性 grouped GEMM" |
+| **N3** | decode 里的零碎 kernel（逐元素/量化/拷贝 ≈ 27%） | decode 的第二瓶颈（E4a） | 统计 kernel 数量与平均耗时；找可融合的（如 norm+quantize、scaled-add） |
+| **N4** | 投机解码（MTP）在本机的实际收益 | E5 表明 width 成本非线性，投机可能正收益 | 用模型自带的 MTP 头跑 `--draft-max 3`，比较 8 槽位下的总吞吐 |
+| **N5** | pp65536 掉到 1410（pp16384 是 1740） | 长上下文是主场配置 | FA 与 KV 的分段测量（`-p` 曲线 + 消融） |
+
+---
+
+## 测量卫生（本轮新增，务必遵守）
+
+- **`llama-bench` 的 `test_gen` 永远单 token decode**（源码见 §0）：不要用它做"宽度/批处理"实验，用 `llama-server -np N` + 并发请求。
+- `llama-bench` 关 repack 用 **`--repack 0`**（不是 `-nr`/`--no-repack`，也不是 `LLAMA_ARG_REPACK`）。
+- `llama-bench` 默认吞 `GGML_LOG_WARN`：要看 witness / `Repacked model buffer size` 必须加 `-v`。
+- `llama-perplexity` 的 PPL 随 `-b` 变：on/off 对照**必须同 `-b`**；误差棒相同即逐位一致。
+- **rocprofv3 的 attach 模式在容器里不可用**（`librocprofiler-sdk-rocattach.so` 返回 1，即使给 `--cap-add SYS_PTRACE` + `seccomp=unconfined`），需要目标进程预载 profiler。
+- **用 profiler 采"加载 + 工作负载"整段代价极高**（加载阶段被拖到 10~20 分钟，因为 dio/repack 期间有大量 HIP 调用被拦截）。
+  可行做法：采一次短工作负载，然后按"最大时间间隔"切出窗口（本页 E4a 就是这么做的）。
+- `rocm-smi --showuse` / `amd-smi metric --usage` 在本机上**采样不到真实忙时**（多数为 0，偶发单卡尖峰），不能用来做利用率归因。
+- 重启仓库后必须抽查一个已知有差异的 shape（如 `test-backend-ops perf -o GATED_DELTA_NET` 的 H=32/tok=512，chunk 应 ~1480 µs 而非 ~1053 µs），避免"用错树构建"的假结果。
