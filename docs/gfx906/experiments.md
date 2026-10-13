@@ -136,19 +136,73 @@ for (int i = 0; i < n_gen; i++) {
 
 ---
 
-## E7. 引擎选型：vLLM 是不是选项
+## E7. 引擎选型（**已修订**：gfx906 社区生态盘点，2026-10-13）
 
-- **模型侧：vLLM 有**。`vllm/model_executor/models/qwen3_next.py` 实现了 Qwen3-Next 的
-  `Qwen3NextSparseMoeBlock`；GDN 层已抽成共享的 `GatedDeltaNetAttention`（PR #37975）；官方博客/Recipes 有 Qwen3-Next 支持与 MTP。
-- **硬件侧：明确不支持 gfx906**。
-  - vLLM issue #22458（"Please add support for AMD Instinct MI50"，2025-08）→ **closed as not planned**；
-  - PR #33811 专门加注释说明 gfx906(MI50/MI60) 不被支持（op 里说明即便列在 HIP 架构里也跑不起来）；
-  - MI50 自 ROCm 6.0 起被 deprecated；vLLM 要求 ROCm 6.3+；
-  - PR #12431（"add support for AMD MI25/50/60"）亦被关闭。
-- **结论**：换 vLLM = fork vLLM + 把它的 Triton/量化 kernel 移植到 gfx906（Triton 无 gfx906 后端）+ 适配新架构变体，
-  是**数月级、且收益未证**的工程。**llama.cpp 仍是基座**，优化应针对 E3/E4 测出的瓶颈（专家 GEMM 效率、decode 的零碎 kernel）。
+### E7-原始结论（作废）
+只查官方 vLLM → "gfx906 不被支持"（issue #22458 closed not planned、PR #33811、MI50 自 ROCm 6.0 弃用）。
+**该结论作废**：用户指出存在社区 fork（并可复现），实测 GitHub 搜索 `gfx906` 有 **93 个仓库**。
 
----
+### 生态盘点（GitHub API 实测，2026-10-13）
+
+| 仓库 | star | 状态 | 关键信息 |
+|---|---:|---|---|
+| `mixa3607/ML-gfx906` | 352 | 活跃 | llama.cpp/vLLM/PyTorch 的 gfx906 构建镜像 —— **我们用的 builder 镜像就来自这里** |
+| `nlzy/vllm-gfx906` | 435 | **已归档**（2026-02） | 初代 gfx906 vLLM；需 ROCm 6.3 + `nlzy/triton-gfx906` v3.5.0；量化只推荐 GPTQ/AWQ(W4A16 INT)；**其 README 明确写 "All MoE quantization models are significantly slow"** |
+| `nlzy/triton-gfx906` | 48 | 已归档（2025-12） | gfx906 版 Triton |
+| **`sixvolts/llamacpp-gfx906-furnace`** | 17 | **活跃**（2026-10-11 仍在推） | **见下方专节：与本项目正面重合** |
+| `sixvolts/reinstinct` | 17 | 活跃（2026-10-04） | 自研 HIP 推理引擎（MI50/MI60）；furnace 的 repack/DPP 技术"从这里的生产实现移植" |
+| `ttdxq/gfx906-vllm` | 43 | **活跃**（2026-09-29） | nlzy fork 的继任者，持续跟上游；**已支持 Qwen3.5 MoE 架构的 GGUF（含 MTP/多模态）并在单卡 32 GiB gfx906 实测可用** |
+| `0c33/mi50-vllm-lab` | 4 | 活跃（2026-10-11） | vLLM 自定义 kernel：2×MI50 上 **DFlash2 投机 73.7 t/s、MTP 65.1 t/s**；200k 上下文（int8 KV）；**TP=2 all-reduce 28 µs（RCCL 72 µs，逐位一致）**（≈我们的 F2 思路） |
+| `nick413-bit/gfx906-fa-vllm` | 16 | 活跃 | vLLM 的 FlashAttention 风格自定义 attention backend |
+| `Wulfsta/vllm-flake` | 18 | 活跃 | Nix 构建 gfx906 vLLM |
+| `xxDoman/strata-gfx906` | 8 | 活跃（2026-10-12） | 第三方引擎 **Strata，明确支持 Qwen3.8-Flash-Next**；2 卡 IQ3_XXS + `--spec 4`：decode 41~44 t/s、4K prompt 473~547 t/s；带 `--mmap-experts` |
+| `milpster/gfx906-llama-cpp`, `skyne98/wiki-gfx906`, `kyuz0/mi50-gfx906-toolboxes` … | — | — | 更多构建/资料 |
+
+### **`sixvolts/llamacpp-gfx906-furnace` 与本项目正面重合（最重要发现）**
+
+其 README 自述：为 Vega20 重调的 llama.cpp，"**加入 GCN 权重重排 GPU buffer type 与 DPP warp reduce**（从 `reinstinct` 生产实现移植），以及**在 4 张 MI50 上服务 177B 稀疏注意力 MoE（Qwen3.8-Flash-Next / Swift 1.5，`qwen4exp`）所需的 kernel、内存布局与服务端改动**"。
+即：**同一个模型、同一类卡、同一个技术路线（权重重排）**，而且已经解决/覆盖了我们这次测出来的全部三个缺口：
+
+| 我们测出的缺口 | furnace 的对应工作 | 他们的实测 |
+|---|---|---|
+| **N1** layer 模式的 8 卡被串行化（我们未证实） | `GGML_SCHED_SYNC_INPUTS`：图输入改为从 pinned staging 异步下发 | **pp8192 877 → 1978 t/s** |
+| **N2** 专家 GEMM 只有 ~11% 峰值 | MoE 直接 in-kernel 路由（decode）+ **grouped 16-token-tile GEMM**（prefill）；`GGML_CUDA_NO_MOE_SMALL` 可关 | 见下表 |
+| **N4** 投机解码的账 | 移植上游 PR #28243 的 NextN/MTP draft head + **adaptive MTP** `--spec-draft-max-slots` | 单用户 decode +17%~+40%（取决于文本），多用户下不亏 |
+| repack（我们的 F9） | **three-plane K-quant repack**（Q4_K/Q5_K/Q6_K，含 MoE 专家堆叠），`GGML_CUDA_REPACK=0` 关；Q8_0/Q5_1 repack 为**可选**（`GGML_CUDA_REPACK_Q8_0=1`） | 声称 on-disk 布局把 GCN matvec 限制在 ~58% HBM 带宽，重排后 ~89%；单卡 Qwen3.6-35B-A3B UD-Q4_K_XL pp512 864→968 (+12%)、tg 持平 |
+| qwen4exp 异形结构 | LDS-resident GDN prefill/decode、QSA indexer 池化/块打分融合、块布局缓存、**稀疏 decode attention**、并行 top-k radix select、hyper-connection/共享专家尾部融合 | pp4096@48K 深度 622→1150 t/s |
+| 多卡 gfx906 | **`-DGGML_CUDA_NO_PEER_COPY=ON`**（PCIe peer copy 在该 HIP 运行时崩溃）+ 异步分阶段拷贝替代 | — |
+
+**其 4×MI50 上的生产数据（同一模型 UD-Q4_K_XL）**：pp8192 1977 t/s、tg64 49.2 t/s、6 路并发 decode 104.6 t/s 聚合；
+server 端 prefill 8K 1251 / 32K 1561 t/s，decode 1/2/6 用户 62/78/98 t/s，6 流混合 20 分钟完成 191 请求。
+
+**对照我们（8×MI50，PP8+repack）**：pp4096 1468、tg128 35.3（单流）、8 槽并发 83.1 t/s。
+**即：他们用 4 张卡就超过我们用 8 张卡的 prefill 与并发 decode。**
+
+### 结论与规划影响
+
+1. **"从 mxxm fork 逐个移植"的路线应当停止**——它在做同样的事、且更先进；继续走下去是重复造轮子。
+2. **我们的测量结论被独立验证**：N1（串行化）、N2（MoE 效率）、N4（投机）全都被他们以真实优化解决，方向完全一致。
+3. **我们的资产应重新定位**：① 可复现的测量与验收方法（E2/E4/E5 + `acceptance.sh`，未见他们有公开同类套件）；
+   ② 具体发现（Q8_0 是 repack 最大贡献 +25%、融合在宽度≥2 逐位一致、专家 GEMM 仅 11% 峰值、EP/TP 通信账）；
+   ③ 可反哺社区（issue/PR）。
+4. **下一步必须先做"采用评估"（E9），再谈引擎横向对比（E8）**，详见下节。
+
+### E9. 采用评估（新增，最高优先）
+
+| 步骤 | 内容 |
+|---|---|
+| E9-1 | clone `sixvolts/llamacpp-gfx906-furnace`（`gfx906-perf`），用我们的容器配方构建（**记得加 `-DGGML_CUDA_NO_PEER_COPY=ON`**），并在 8 卡上跑我们自己的 `acceptance.sh` + 标准 bench（pp512/2048/4096/8192、tg128、8 槽并发、MTP） |
+| E9-2 | 与我们的 `gfx906-opt` 逐项对比，确认差距（预期长上下文/并发/投机全面落后） |
+| E9-3 | 决定采用方式：**(a)** 直接以 furnace 为基座（最快，但把维护押给单维护者）；**(b)** 把它的关键提交 cherry-pick 到我们 rebase 风格的 `gfx906-opt`（可控，但工作量大、且它已含大量上游 merge）；**(c)** 只取我们缺口对应的改动（async input staging、MoE grouped GEMM、MTP head），其余保留上游 + 我们的 F2/F9 |
+| E9-4 | 反向输出：把我们的验收套件/测量结论以 issue 或 PR 形式提给他们（他们的验证纪律与我们互补） |
+
+### E8. 引擎横向对比（在 E9 之后）
+
+在同一台机器上跑 **llama.cpp(furnace) vs vLLM(`ttdxq/gfx906-vllm`，或 `0c33` 的自定义 kernel 方案)**，用同类 MoE 模型（若有 GGUF MoE 支持则尽量用我们的 UD-Q4_K_XL）。重点看：
+- MoE 量化的 prefill/decode 绝对效率（nlzy fork 的旧结论是"MoE 量化显著慢"，ttdxq 的 2026-09 更新称已可用，需实测）；
+- 多流调度（`-np 8` vs vLLM continuous batching）；
+- 投机解码（他们 2 卡就到 65~74 t/s）；
+- vLLM 侧是否已有 **EP**（我们 E3 已证明完整宽度对专家 GEMM 至关重要）。
 
 ## E6. 验收套件（已落地）
 
