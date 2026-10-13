@@ -213,36 +213,53 @@ server 端 prefill 8K 1251 / 32K 1561 t/s，decode 1/2/6 用户 62/78/98 t/s，6
 
 ---
 
-## E9. furnace 采用评估（**已实测**，2026-10-13）
+## E9. furnace 采用评估（**已实测；含对首版的更正**）
 
-`sixvolts/llamacpp-gfx906-furnace` @ `7ba588b8d`（2026-10-11），按它的配方 + 我们的容器构建：
-`-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 -DGPU_TARGETS=gfx906 -DGGML_HIP_GRAPHS=ON -DGGML_CUDA_NO_PEER_COPY=ON -DGGML_HIP_RCCL=ON -DLLAMA_CURL=OFF`。
-同机同模型（8×MI50，UD-Q4_K_XL，`-lm dio`，`-fa on`，`-sm layer`，`-r 2`）：
+`sixvolts/llamacpp-gfx906-furnace` @ `7ba588b8d`（2026-10-11，MIT，17★，单维护者，2026-10-11 仍在更新），
+按它的配方构建：`-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 -DGPU_TARGETS=gfx906 -DGGML_HIP_GRAPHS=ON -DGGML_CUDA_NO_PEER_COPY=ON -DGGML_HIP_RCCL=ON -DLLAMA_CURL=OFF`。
 
-| 指标 | **我们**（上游+F2+F9） | furnace 默认 | furnace 关异步输入 | furnace 最佳 |
-|---|---|---|---|---|
-| pp512 | 451.6 | **487.7** | — | 487.7 |
-| pp2048 | 1169.6 | **1263.8** | — | 1263.8 |
-| pp4096 | **1472.0** | 686.4 | 686.4 | 743.1（ub1024） |
-| pp8192 | **1672.5** | 345.4 | 1027.9 | 1128.8（ub1024） |
-| 单流 tg128/64 | 35.2（**MTP 40.8**） | 40.6 | **45.1** | 45.1 |
-| 8 槽并发总吞吐 | 83.1（MTP 46.9） | **95.5** | — | — |
+### ⚠️ 首版评估作废的原因
+首版跑 furnace 时**漏了它生产配置里的两个开关**：`GGML_CUDA_REPACK_Q8_0=1` 与 `GGML_CUDA_REPACK_Q5_1=1`
+（在它的树里 Q8_0/Q5_1 的重排是**可选默认关**的，而它的 4 卡成绩是开着的）。补上之后长上下文与 decode 大幅变化：
 
-**已排除的假设（逐个实测，都不是原因）**
-- 它的 qwen4exp 专用内核开关全部无效：`GGML_CUDA_NO_FA_SPARSE_PREFILL`、`NO_QSA_POOL`、`NO_QSA_SCORE`、`LLAMA_QSA_NO_MS_CACHE`、
-  `NO_MOE_SMALL`、`NO_Q8_NC`、`NO_F32_NC`、`NO_Q8_MULTI`、`NO_Q8_EMIT`、`NO_HC_UP_PRE`、`NO_REPACK_FLATTEN` → pp4096 恒为 685~686。
-- 它的生产配置（`-b 16384 -ub 1024`）只把 pp4096 提到 743、pp8192 到 1129。
-- `GGML_SCHED_SYNC_INPUTS=1`（关掉它的异步输入 staging）在 pp4096 无变化，但把 **pp8192 从 345 → 1028**：
-  即它引以为傲的异步 staging 在**我们 8 卡的长上下文上是负优化**（它是在 4 卡上调的）。
-- 重排的影响：`GGML_CUDA_REPACK=0` → pp512 382.7 / pp2048 966 / pp4096 536 / pp8192 807
-  ⇒ 它的重排在短上下文 +27~31%，在长上下文反而 **−57%**（与我们 F9 的 +22~34% 相反）。
-- `-lm dio` vs 默认加载：无实质差别。
+| 指标 | 漏配置（首版） | **补上配置（正确）** |
+|---|---|---|
+| pp4096 | 686 | **1133.8** |
+| pp8192 | 345 | **1667.7** |
+| tg64/128 | 40.6 | **51.6** |
 
-**结论**
-1. **不整体采用**：长上下文 prefill 在我们 8 卡上退化 2~5 倍，对"长上下文为主"的负载是硬伤。
-2. **摘取三块**（见下节 E10 与"下一步"）：① MTP（我们已有 +25%）；② 多槽位下的 draft 限流开关（~10 行）；
-   ③ 它在 8 槽并发上 +15% 的 decode 内核（MoE 小批量/in-kernel 路由、多列 Q8_0 matvec、GDN decode、稀疏 decode attention、hc/shexp 尾部融合）。
-3. **反馈一个 bug**：它的异步输入 staging 在 8 卡上把 pp8192 从 1028 拉到 345（可复现），值得报到它的 issue。
+因此首版的两条结论一并撤回：① "它的异步输入 staging 在 8 卡上是负优化" —— 补配置后
+`GGML_SCHED_SYNC_INPUTS=1` 与默认**完全无差别**（pp4096 1133.7 vs 1134.8、pp8192 1666.6 vs 1670.6、tg 51.05 vs 51.99），
+那是漏配置造成的假象；② "长上下文退化 2~5 倍" 同样作废。
+
+### 正确的对比（同机同模型：8×MI50，Qwen3.8-Flash-Next UD-Q4_K_XL，`-lm dio`，`-fa on`，`-sm layer`）
+
+| 指标 | **我们**（上游+F2+F9） | **furnace（生产配置）** | 差异 |
+|---|---:|---:|---|
+| pp512 | 451.6 | **815.0** | furnace **+80%** |
+| pp2048 | 1169.6 | **2131.5** | furnace **+82%** |
+| pp4096 | **1472.0** | 1133.8 | 我们 **+30%**（异常点，见下） |
+| pp8192 | 1672.5 | 1667.7 | 打平 |
+| tg128 | 35.2（**MTP 40.8**） | **51.6** | furnace **+47%**（对 MTP 也 +26%） |
+| 单流 server decode | 32.6（MTP 40.8） | **47.0** | furnace +44% |
+| 2 槽 / 4 槽 / 8 槽总吞吐 | 47.5 / 54.9 / 83.1 | **64.1 / 92.6 / 103.8** | furnace +35% / +69% / +25% |
+
+（furnace 服务端跑它的生产风格配置：`-np 8 -c 32768 -b 16384 -ub 1024`；我们跑 `-np 8 -c 32768`，两者都短 prompt + `ignore_eos`。）
+
+**遗留异常**：furnace 自己的曲线是 pp512 815 → pp2048 2132 → **pp4096 1134** → pp8192 1667，
+2048→4096 掉 47%，8192 又涨回来，**非单调**。需要单独复测（隔离每个 prompt 尺寸、清页缓存）确认是它的真实行为还是测量假象。
+
+### 修订后的结论
+
+1. **furnace 现在是基座首选**（原本"不整体采用"的结论作废）：除 pp4096 一个点外，它在 prefill、decode、多槽并发上全面领先，
+   而且它还有 MTP + adaptive draft slots + 多槽 decode 路径。
+2. **切换前必须做的三件验证**（我们的 `acceptance.sh` 正好就是干这个的）：
+   ① 复测 pp4096 异常；② 在 furnace 上跑我们的验收套件（重排 A/B、token 一致性、宽度 1 的 PPL 基线、8 卡是否都用重排 buffer）；
+   ③ 核对它的 `GGML_CUDA_REPACK` 语义与我们 `--repack` 的差异（它是 env + 可选类型，我们是 `--repack` + 默认 3 类型）。
+3. **采用方式**：直接以 `gfx906-perf` 为工作分支（它的提交习惯是跟上上游 merge，不适用我们的 rebase 风格）；
+   我们的 `gfx906-opt`（干净上游 + F2/F9）保留为**对照基线**。
+4. **我们的资产没白做**：① 验收套件/测量方法学正是接纳一个新基座所需要的；② 本次"漏配置导致错误对比"的教训也已记录；
+   ③ F9 的重排实现与 furnace 的重排是同一思路的两个独立实现，可交叉验证（我们 Q4_K+Q5_1+Q8_0 = +34%，它 = +65~383%，差别在 canonical 路径的效率）。
 
 ## E10. MTP 实测（**我们自己的树就支持**，上游已合 qwen4exp NextN/MTP）
 
