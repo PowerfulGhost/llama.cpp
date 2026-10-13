@@ -213,6 +213,53 @@ server 端 prefill 8K 1251 / 32K 1561 t/s，decode 1/2/6 用户 62/78/98 t/s，6
 
 ---
 
+## E9. furnace 采用评估（**已实测**，2026-10-13）
+
+`sixvolts/llamacpp-gfx906-furnace` @ `7ba588b8d`（2026-10-11），按它的配方 + 我们的容器构建：
+`-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 -DGPU_TARGETS=gfx906 -DGGML_HIP_GRAPHS=ON -DGGML_CUDA_NO_PEER_COPY=ON -DGGML_HIP_RCCL=ON -DLLAMA_CURL=OFF`。
+同机同模型（8×MI50，UD-Q4_K_XL，`-lm dio`，`-fa on`，`-sm layer`，`-r 2`）：
+
+| 指标 | **我们**（上游+F2+F9） | furnace 默认 | furnace 关异步输入 | furnace 最佳 |
+|---|---|---|---|---|
+| pp512 | 451.6 | **487.7** | — | 487.7 |
+| pp2048 | 1169.6 | **1263.8** | — | 1263.8 |
+| pp4096 | **1472.0** | 686.4 | 686.4 | 743.1（ub1024） |
+| pp8192 | **1672.5** | 345.4 | 1027.9 | 1128.8（ub1024） |
+| 单流 tg128/64 | 35.2（**MTP 40.8**） | 40.6 | **45.1** | 45.1 |
+| 8 槽并发总吞吐 | 83.1（MTP 46.9） | **95.5** | — | — |
+
+**已排除的假设（逐个实测，都不是原因）**
+- 它的 qwen4exp 专用内核开关全部无效：`GGML_CUDA_NO_FA_SPARSE_PREFILL`、`NO_QSA_POOL`、`NO_QSA_SCORE`、`LLAMA_QSA_NO_MS_CACHE`、
+  `NO_MOE_SMALL`、`NO_Q8_NC`、`NO_F32_NC`、`NO_Q8_MULTI`、`NO_Q8_EMIT`、`NO_HC_UP_PRE`、`NO_REPACK_FLATTEN` → pp4096 恒为 685~686。
+- 它的生产配置（`-b 16384 -ub 1024`）只把 pp4096 提到 743、pp8192 到 1129。
+- `GGML_SCHED_SYNC_INPUTS=1`（关掉它的异步输入 staging）在 pp4096 无变化，但把 **pp8192 从 345 → 1028**：
+  即它引以为傲的异步 staging 在**我们 8 卡的长上下文上是负优化**（它是在 4 卡上调的）。
+- 重排的影响：`GGML_CUDA_REPACK=0` → pp512 382.7 / pp2048 966 / pp4096 536 / pp8192 807
+  ⇒ 它的重排在短上下文 +27~31%，在长上下文反而 **−57%**（与我们 F9 的 +22~34% 相反）。
+- `-lm dio` vs 默认加载：无实质差别。
+
+**结论**
+1. **不整体采用**：长上下文 prefill 在我们 8 卡上退化 2~5 倍，对"长上下文为主"的负载是硬伤。
+2. **摘取三块**（见下节 E10 与"下一步"）：① MTP（我们已有 +25%）；② 多槽位下的 draft 限流开关（~10 行）；
+   ③ 它在 8 槽并发上 +15% 的 decode 内核（MoE 小批量/in-kernel 路由、多列 Q8_0 matvec、GDN decode、稀疏 decode attention、hc/shexp 尾部融合）。
+3. **反馈一个 bug**：它的异步输入 staging 在 8 卡上把 pp8192 从 1028 拉到 345（可复现），值得报到它的 issue。
+
+## E10. MTP 实测（**我们自己的树就支持**，上游已合 qwen4exp NextN/MTP）
+
+命令：`llama-server ... -md /models/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf --spec-draft-n-max 2`（短 prompt + `ignore_eos`，128 token）。
+
+| 场景 | 无 MTP | 有 MTP | 变化 |
+|---|---:|---:|---|
+| 单流 decode | 32.6 t/s | **40.8 t/s** | **+25%** |
+| 8 槽并发总吞吐 | 83.1 t/s | 46.9 t/s | **−44%** |
+
+- 接受率 **51.6%**（64 accepted / 124 generated），平均接受长度 **2.03** —— 与 furnace 报告的 60~65%（原始文本续写）一致量级。
+- 8 槽下变慢的原因与 furnace README 一致：verify 批次让**每个槽**都付 draft 的 matvec 与专家开销，聚合吞吐反而下降。
+- **修复只需 furnace 的 `--spec-draft-max-slots N`（"最多 N 个槽在生成时才 draft"），实现约 10 行**：
+  `common/common.h` 加一个 `int32_t max_slots`（已在其 328 行）→ `common/arg.cpp` 注册选项 →
+  `tools/server/server-context.cpp` 两行判断（`draft_max_slots` / `draft_allowed`）+ props 一行。
+  ⇒ 这是**当前性价比最高的一步**：单流 +25%，多流不退化。
+
 ## 已定论（本轮之前算清，不必重测）
 
 1. **TP 的集合通信无法被计算掩盖，而且掩盖了也翻不了盘**：meta 后端是"每子图 8 卡并发算 → AllReduce（host 发起，屏障）→ 下一子图"；
