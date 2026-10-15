@@ -3947,6 +3947,21 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
 // sma_*: the block output is the shared-expert combine SIGMOID -> MUL -> ADD, folded in
 // (the caller checks that DSV4_HC_POST reads it). Returns the number of nodes after i it
 // covered, 0 = not fused. dry: only report whether it would run (nothing launched).
+// [gfx906-opt P3.3] out-of-order invalidation for a node evaluated ahead of its place
+static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * n) {
+    if (n == nullptr || n->data == nullptr) return;
+    const char * lo = (const char *) n->data;
+    const char * hi = lo + ggml_nbytes(n);
+    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+        auto & e = cuda_ctx->repack_xq[k];
+        if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+        if (e.producer_nbytes == 0) continue;
+        const char * elo = (const char *) e.producer_data;
+        const char * ehi = elo + e.producer_nbytes;
+        if (lo < ehi && elo < hi) e.gen = 0;
+    }
+}
+
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
     static const bool no_hc_norm = getenv("GFX906_NO_HC_POST_NORM") != nullptr;
@@ -4857,7 +4872,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         const bool ok3 = !ov(a, add) && (b_alias || !ov(b, add)) && !ov(g, add);
                         return ok3;
                     }()) {
-                                ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, (ggml_tensor *) g,
+                // [gfx906-opt P3.3] hc_sma variant: the add is the hc block output
+                // (feeds DSV4_HC_POST as x); fold in the inject matvec (runs first, at
+                // i+3 when it is the next node) and the POST chain as one more launch
+                static const bool no_hcsma = getenv("GFX906_NO_HC_SMA") != nullptr;
+                if (!no_hcsma && i + 11 < cgraph->n_nodes) {
+                    ggml_tensor * inj = cgraph->nodes[i + 3];
+                    if (inj->op == GGML_OP_MUL_MAT && inj->src[0] != add && inj->src[1] != add &&
+                            cgraph->nodes[i + 4]->src[0] == inj &&
+                            cgraph->nodes[i + 7]->op == GGML_OP_DSV4_HC_POST &&
+                            cgraph->nodes[i + 7]->src[0] == add && cgraph->nodes[i + 7]->src[1] != add) {
+                        if (ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i + 4, g, a, b, true) > 0 &&
+                                ggml_cuda_compute_forward(*cuda_ctx, inj)) {
+                            q8x_invalid_range(cuda_ctx, inj);
+                            const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i + 4, g, a, b);
+                            GGML_ASSERT(n_hc > 0);
+                            return 4 + n_hc;
+                        }
+                    }
+                }
+                ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, (ggml_tensor *) g,
                         (ggml_tensor *) a, (ggml_tensor *) b, add);
                 GGML_LOG_INFO("[gfx906-sma] fused sigmoid-mul-add: g=%s a=%s b=%s dst=%s\n", g->name, a->name, b->name, add->name);
                 return 2;
