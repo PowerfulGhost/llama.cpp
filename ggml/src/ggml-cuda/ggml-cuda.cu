@@ -3759,6 +3759,46 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
     return plan;
 }
 
+// [gfx906-opt P3] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL at node i
+// (qwen4exp hc combine weights, combine and the next hc mix norm) in one launch;
+// sma_*: the block output is the shared-expert combine SIGMOID -> MUL -> ADD, folded in
+// (the caller checks that DSV4_HC_POST reads it). Returns the number of nodes after i it
+// covered, 0 = not fused. dry: only report whether it would run (nothing launched).
+static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+        const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
+    static const bool no_hc_norm = getenv("GFX906_NO_HC_POST_NORM") != nullptr;
+    if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * sc1  = cgraph->nodes[i];
+    ggml_tensor * sig  = cgraph->nodes[i + 1];
+    ggml_tensor * sc2  = cgraph->nodes[i + 2];
+    ggml_tensor * post = cgraph->nodes[i + 3];
+    ggml_tensor * norm = cgraph->nodes[i + 4];
+    ggml_tensor * mul  = cgraph->nodes[i + 5];
+    const float s_in  = ggml_get_op_params_f32(sc1, 0);
+    const float s_out = ggml_get_op_params_f32(sc2, 0);
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            sig->src[0] != sc1 || sc2->src[0] != sig || sc2->op != GGML_OP_SCALE ||
+            post->op != GGML_OP_DSV4_HC_POST || post->src[2] != sc2 ||
+            !ggml_node_has_n_uses(cgraph, i + 2, 1) ||
+            norm->op != GGML_OP_RMS_NORM || norm->src[0] != post || !ggml_node_has_n_uses(cgraph, i + 4, 1) ||
+            mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm) ||
+            !(post->flags & GGML_TENSOR_FLAG_COMPUTE) || !(norm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_are_same_stride(sc1->src[0], sc2)) {
+        return 0;
+    }
+    // the launcher checks which overlaps of outputs and inputs its kernel tolerates
+    if (dry) {
+        return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, s_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
+    }
+    void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, mul);
+    if (ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, s_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
+        return 5;
+    }
+    return 0;
+}
+
 // [gfx906-opt P3] byte-range overlap of two tensors' storage
 static bool ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     if (!a || !b || a->data == nullptr || b->data == nullptr) {
@@ -4620,6 +4660,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // [gfx906-opt P3.2] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL
+    // (qwen4exp hc combine + the next hc mix norm): 6 launches -> 1
+    if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
+        static const bool no_hcpn = getenv("GFX906_NO_HC_POST_NORM") != nullptr;
+        if (!no_hcpn) {
+            const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
+            if (n_hc > 0) {
+                return n_hc;
+            }
+        }
     }
 
     // [gfx906-opt P3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
