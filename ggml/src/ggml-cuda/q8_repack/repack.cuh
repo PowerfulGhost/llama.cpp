@@ -67,6 +67,15 @@ inline void ggml_cuda_mul_mat_id_vec_repacked_fused(
     GGML_ABORT("repacked weights are unavailable on MUSA");
 }
 
+inline bool ggml_cuda_repack_multi_ok(const ggml_tensor *) {
+    return false;
+}
+
+inline void ggml_cuda_mul_mat_repacked_multi(
+        ggml_backend_cuda_context &, ggml_tensor * const *, int) {
+    GGML_ABORT("repacked weights are unavailable on MUSA");
+}
+
 #else
 
 bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft);
@@ -103,6 +112,12 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 // the multi-column mat-vec, which is the only shape the fused FFN entry points
 // below can serve. Wider batches fall through to the tiled GEMM.
 bool ggml_cuda_repack_mmv_fusion_width_ok(int64_t n_tokens, bool has_ids, ggml_type wt);
+
+// Grouped decode path (gfx906): true for a MUL_MAT usable by the shared-activation
+// grouped repacked-Q8_0 mat-vec (n consecutive nodes sharing src1).
+bool ggml_cuda_repack_multi_ok(const ggml_tensor * mm);
+void ggml_cuda_mul_mat_repacked_multi(
+        ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n);
 
 void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
