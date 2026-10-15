@@ -3784,6 +3784,64 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// gfx906 q8-multi plan: group dense repacked Q8_0 mat-vecs sharing src1.
+struct q8m_group {
+    const ggml_tensor * head;
+    std::array<const ggml_tensor *, 3> mms;
+    int n;
+};
+
+// GLU-consumed candidates: the T2 fused up/gate+GLU epilogue owns them when
+// GGML_CUDA_REPACK_MMV_FUSION is on; when it is off the canonical path runs
+// three separate launches for (gate, up, GLU), so grouping the two mat-vecs
+// there is still a win. The grouped kernel computes each row exactly like the
+// ungrouped one, so the outputs stay bitwise identical either way.
+static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, const std::vector<int> & glu_consumed,
+        bool glu_fusion_enabled) {
+    std::vector<q8m_group> plan;
+    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> by_src1;
+    if (getenv("GFX906_Q8_MULTI_DEBUG")) fprintf(stderr, "[q8m-build] n_nodes=%d\n", cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT
+                || (glu_fusion_enabled && glu_consumed[i])
+                || !ggml_cuda_repack_multi_ok(node)) {   // same predicate incl. env off-switch
+            continue;
+        }
+        by_src1[node->src[1]].push_back(node);
+    }
+    if (getenv("GFX906_Q8_MULTI_DEBUG")) {
+        size_t qel = 0;
+        for (auto & kv : by_src1) qel += kv.second.size();
+        fprintf(stderr, "[q8m-build] eligible=%zu buckets=%zu\n", qel, by_src1.size());
+    }
+    for (auto & [src1, members0] : by_src1) {
+        if (members0.size() < 2) {
+            continue;
+        }
+        if (getenv("GFX906_Q8_MULTI_DEBUG")) {
+            fprintf(stderr, "[q8m-plan] src1=%p count=%zu :", (void*) src1, members0.size());
+            for (auto * m : members0) fprintf(stderr, " %s(ne0=%d ne1=%d)", m->name, (int)m->src[0]->ne[0], (int)m->src[0]->ne[1]);
+            fprintf(stderr, "\n");
+        }
+        q8m_group g{};
+        g.head = members0[0];
+        const int64_t ne00 = members0[0]->src[0]->ne[0];
+        for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
+            if (k > 0 && members0[k]->src[0]->ne[0] != ne00) {
+                continue;
+            }
+            // members must share src1 AND weight-device locality is implied by src1 sharing
+            g.mms[g.n++] = members0[k];
+        }
+        if (g.n >= 2) {
+            plan.push_back(g);
+            if (plan.size() >= GGML_CUDA_MAX_DEVICES * 48) break;
+        }
+    }
+    return plan;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3792,6 +3850,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // gfx906 family: (dbg) dump repacked Q8_0 MUL_MAT candidates under GFX906_Q8_MULTI_DEBUG=1
+    if (node->op == GGML_OP_MUL_MAT) {
+        static int dbg = getenv("GFX906_Q8_MULTI_DEBUG") ? (getenv("GFX906_Q8_MULTI_DEBUG")[0] == '1' ? 1 : 0) : 0;
+        static int dbg_count = 0;
+        if (dbg && dbg_count < 40) {
+            dbg_count++;
+            const ggml_tensor * w0 = node->src[0];
+            fprintf(stderr, "[q8-mulmat] %s: fire=%d wtype=%s wview=%p ne0=%d ne1=%d src1=%p\n",
+                node->name,
+                (int) ggml_cuda_repack_mul_mat_should_fire(w0),
+                ggml_type_name(w0->type), (void *) w0->view_src,
+                (int) w0->ne[0], (int) w0->ne[1], (void *) node->src[1]);
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -4710,8 +4783,54 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // gfx906 family: group dense repacked Q8_0 mat-vecs that share the
+            // same F32 activation (same src1). Members' input deps are a subset of
+            // the head's, so the plan is legal to launch whenever the head is
+            // reached, wherever the members sit in the graph. GLU-consumed rows
+            // (the up/gate fused-epilogue chains) are excluded so the existing
+            // fusions keep priority.
+            std::vector<int> q8m_glu_consumed(cgraph->n_nodes, 0);
+            {
+                std::unordered_map<const ggml_tensor *, int> node_idx;
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    node_idx[cgraph->nodes[i]] = i;
+                }
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const ggml_tensor * u = cgraph->nodes[i];
+                    if (u->op != GGML_OP_GLU) {
+                        continue;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC && u->src[s] != nullptr; s++) {
+                        if (u->src[s]->op == GGML_OP_MUL_MAT) {
+                            auto it = node_idx.find(u->src[s]);
+                            if (it != node_idx.end()) {
+                                q8m_glu_consumed[it->second] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            std::vector<q8m_group> q8m_groups;
+            std::unordered_map<const ggml_tensor *, q8m_group *> q8m_member_of;
+            const bool repack_glu_fusion = getenv("GGML_CUDA_REPACK_MMV_FUSION") != nullptr;
+            if (getenv("GFX906_Q8_MULTI_OFF") == nullptr) {
+                q8m_groups = q8m_build_plan(cgraph, q8m_glu_consumed, repack_glu_fusion);
+                for (auto & g : q8m_groups) {
+                    for (int k = 0; k < g.n; k++) {
+                        q8m_member_of[g.mms[k]] = &g;
+                    }
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                q8m_group * q8m_g = nullptr;
+                if (!q8m_member_of.empty()) {
+                    auto it = q8m_member_of.find(node);
+                    if (it != q8m_member_of.end()) {
+                        q8m_g = it->second;
+                    }
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4749,6 +4868,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // gfx906 q8-multi: non-head members are already produced by the head's
+                // one grouped launch; head launches the group here.
+                if (q8m_g) {
+                    if (node == q8m_g->head) {
+                        ggml_cuda_mul_mat_repacked_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(q8m_g->mms.data()), q8m_g->n);
+                    }
                     continue;
                 }
 
