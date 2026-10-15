@@ -791,14 +791,16 @@ static __device__ __forceinline__ float gfx906_hc_sma_combine(const float b, con
 template <int HC, bool SMA>
 static __global__ void __launch_bounds__(1024) hc_post_rms_norm_mul_q8_f32(
         const float * inject, const int64_t sinj, const float * x, const int64_t sx1, const float * sma_a, const float * sma_g,
-        const float * residual, const int64_t sr1, const int64_t sr2, float * post, const float s_in, const float s_out,
+        const float * residual, const int64_t sr1, const int64_t sr2, float * post, const float s_in, const float b_in,
+        const float s_out, const float b_out,
         const float * __restrict__ mul, float * dst, const int ncols, const float eps, block_q8_1 * __restrict__ yq) {
     const int s   = blockIdx.x;
     const int it  = blockIdx.y;
     const int tid = threadIdx.x;
 
-    const float sigv = 1.0f / (1.0f + expf(-s_in * inject[s + it*sinj]));
-    const float   w  = sigv * s_out;
+    // exactly the SCALE -> SIGMOID -> SCALE sequence; each step rounds once
+    const float sigv = 1.0f / (1.0f + expf(-(s_in * inject[s + it*sinj] + b_in)));
+    const float   w  = sigv * s_out + b_out;
     const float * xr = x + it * sx1;
     const float * rr = residual + s * sr1 + it * sr2;
     const int64_t off = ((int64_t) it * HC + s) * ncols;
@@ -836,7 +838,7 @@ static __global__ void __launch_bounds__(1024) hc_post_rms_norm_mul_q8_f32(
 // [gfx906-opt P3] host: SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL in one
 // launch; sma_* fold the shared-expert combine (b + a*sigmoid(g)) in as post's x.
 bool ggml_cuda_op_hc_post_rms_norm_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * inject, ggml_tensor * post,
-        const float s_in, const float s_out, const ggml_tensor * norm, ggml_tensor * mul_tensor, void * yq,
+        const float s_in, const float b_in, const float s_out, const float b_out, const ggml_tensor * norm, ggml_tensor * mul_tensor, void * yq,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, const bool dry_run) {
     const ggml_tensor * x   = sma_b != nullptr ? sma_b : post->src[0];
     const ggml_tensor * res = post->src[1];
@@ -895,7 +897,7 @@ bool ggml_cuda_op_hc_post_rms_norm_q8(ggml_backend_cuda_context & ctx, const ggm
         (const float *) inject->data, inject->nb[1] / sizeof(float), (const float *) x->data, x->nb[1] / sizeof(float),
         sma ? (const float *) sma_a->data : nullptr, sma ? (const float *) sma_g->data : nullptr,
         (const float *) res->data, res->nb[1] / sizeof(float), res->nb[2] / sizeof(float),
-        (float *) post->data, s_in, s_out, (const float *) w->data, (float *) mul_tensor->data, (int) n_embd, eps, (block_q8_1 *) yq);
+        (float *) post->data, s_in, b_in, s_out, b_out, (const float *) w->data, (float *) mul_tensor->data, (int) n_embd, eps, (block_q8_1 *) yq);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

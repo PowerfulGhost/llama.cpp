@@ -3964,7 +3964,7 @@ static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_t
 
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
-    static const bool no_hc_norm = getenv("GFX906_NO_HC_POST_NORM") != nullptr;
+    static const bool no_hc_norm = getenv("GFX906_HC_POST_NORM") == nullptr; // opt-in pending bit-parity root-cause
     if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
         return 0;
     }
@@ -3974,6 +3974,12 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
     ggml_tensor * post = cgraph->nodes[i + 3];
     ggml_tensor * norm = cgraph->nodes[i + 4];
     ggml_tensor * mul  = cgraph->nodes[i + 5];
+    // bias bytes exactly as the solo scale kernel reads them (op_params[1]);
+    // garbage there is deterministic per build and must be reproduced
+    float b_in  = 0.0f;
+    float b_out = 0.0f;
+    memcpy(&b_in,  (const float *) sc1->op_params + 1, sizeof(float));
+    memcpy(&b_out, (const float *) sc2->op_params + 1, sizeof(float));
     const float s_in  = ggml_get_op_params_f32(sc1, 0);
     const float s_out = ggml_get_op_params_f32(sc2, 0);
     if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
@@ -3988,11 +3994,20 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
     }
     // the launcher checks which overlaps of outputs and inputs its kernel tolerates
     if (dry) {
-        return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, s_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
+        return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
     }
     void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, mul);
-    if (ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, s_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
+    if (ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
         return 5;
+    }
+    // the q8 emit slot was claimed before the launcher vetoed: never-written q8 in the
+    // ring must not survive (a later consumer whose pool range aliases mul would take a
+    // false cache hit); the per-node invalidation skips its own producer
+    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+        auto & e = cuda_ctx->repack_xq[k];
+        if (e.gen == cuda_ctx->graph_gen && (e.producer == mul || (mul->data && e.data == mul->data))) {
+            e.gen = 0;
+        }
     }
     return 0;
 }
@@ -4875,7 +4890,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // [gfx906-opt P3.3] hc_sma variant: the add is the hc block output
                 // (feeds DSV4_HC_POST as x); fold in the inject matvec (runs first, at
                 // i+3 when it is the next node) and the POST chain as one more launch
-                static const bool no_hcsma = getenv("GFX906_NO_HC_SMA") != nullptr;
+                static const bool no_hcsma = getenv("GFX906_HC_POST_NORM") == nullptr; // rides on the post-norm opt-in
                 if (!no_hcsma && i + 11 < cgraph->n_nodes) {
                     ggml_tensor * inj = cgraph->nodes[i + 3];
                     if (inj->op == GGML_OP_MUL_MAT && inj->src[0] != add && inj->src[1] != add &&
@@ -4903,7 +4918,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // (qwen4exp hc combine + the next hc mix norm): 6 launches -> 1
     if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
-        static const bool no_hcpn = getenv("GFX906_NO_HC_POST_NORM") != nullptr;
+        static const bool no_hcpn = getenv("GFX906_HC_POST_NORM") == nullptr; // opt-in pending bit-parity root-cause
         if (!no_hcpn) {
             const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
             if (n_hc > 0) {
@@ -4915,7 +4930,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [gfx906-opt P3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
     // (qwen4exp hc mix, single-token rows): 4 launches -> 1, bitwise per hc-up-pre.cu
     if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
-        static const bool no_hcup = getenv("GFX906_NO_HC_UP_PRE") != nullptr;
+        static const bool no_hcup = getenv("GFX906_HC_UP_PRE") == nullptr; // opt-in pending bit-parity root-cause
         ggml_tensor * silu = cgraph->nodes[i + 1];
         ggml_tensor * up   = cgraph->nodes[i + 2];
         ggml_tensor * rs   = cgraph->nodes[i + 3];
@@ -4947,12 +4962,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [gfx906-opt P3.4] SCALE -> SILU (hc mix outside hc_up_pre's token window)
     if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
-            (getenv("GFX906_NO_SCALE_SILU") == nullptr) && node->src[0]->type == GGML_TYPE_F32 &&
+            (getenv("GFX906_SCALE_SILU") != nullptr) && node->src[0]->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
             ggml_nelements(node->src[0]) == ggml_nelements(cgraph->nodes[i + 1]) &&
             ggml_node_get_use_count(cgraph, i) == 1 &&
             !ranges_overlap(node->src[0], cgraph->nodes[i + 1])) {
         ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        static int ss_dbg_n = getenv("GFX906_SCALESILU_DEBUG") ? 0 : 40;
+        if (ss_dbg_n++ < 40) fprintf(stderr, "[scale-silu] i=%d %s(s=%g bias=%g) -> %s\n", i, node->name, (double) ggml_get_op_params_f32(node, 0), (double) ((const float *) node->op_params)[1], cgraph->nodes[i + 1]->name);
         return 1;
     }
 
