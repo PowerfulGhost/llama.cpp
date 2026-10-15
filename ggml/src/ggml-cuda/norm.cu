@@ -756,3 +756,146 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// [gfx906-opt P3] q8_1 of one value per lane, 32 consecutive lanes = one block: the
+// arithmetic of quantize_q8_1 (our consumer's quantize cache entry then hits exactly)
+static __device__ __forceinline__ void gfx906_rms_emit_q8_1(block_q8_1 * yq, const int64_t idx, const float v) {
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const int64_t ib  = idx / QK8_1;
+    const int     iqs = idx % QK8_1;
+    yq[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        yq[ib].ds = make_half2(d, sum);
+    }
+}
+
+// [gfx906-opt P3] b + a *sigmoid(g) exactly as sigmoid_mul_add_f32 computes it: no
+// contraction anywhere, including the expf expansion
+static __device__ __forceinline__ float gfx906_hc_sma_combine(const float b, const float a, const float g) {
+#pragma clang fp contract(off)
+    const float s = 1.0f / (1.0f + expf(-g));
+    return b + a * s;
+}
+
+// [gfx906-opt P3] qwen4exp hc combine + the next hc mix norm, one block per (stream, token):
+// w = sigmoid(s_in*inject) * s_out (same product order as SCALE -> SIGMOID -> SCALE),
+// post = x*w + residual (dsv4_hc_post_f32 element order), then RMS_NORM -> MUL with
+// rms_norm_f32's block_reduce structure (1024 threads, cols strided). SMA: x is the
+// shared-expert combine b + a*sigmoid(g[token]) (sigmoid_mul_add_f32 order). Each step
+// keeps the operation order of the kernels it replaces, so results are identical.
+template <int HC, bool SMA>
+static __global__ void __launch_bounds__(1024) hc_post_rms_norm_mul_q8_f32(
+        const float * inject, const int64_t sinj, const float * x, const int64_t sx1, const float * sma_a, const float * sma_g,
+        const float * residual, const int64_t sr1, const int64_t sr2, float * post, const float s_in, const float s_out,
+        const float * __restrict__ mul, float * dst, const int ncols, const float eps, block_q8_1 * __restrict__ yq) {
+    const int s   = blockIdx.x;
+    const int it  = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const float sigv = 1.0f / (1.0f + expf(-s_in * inject[s + it*sinj]));
+    const float   w  = sigv * s_out;
+    const float * xr = x + it * sx1;
+    const float * rr = residual + s * sr1 + it * sr2;
+    const int64_t off = ((int64_t) it * HC + s) * ncols;
+    float * pr = post + off;
+    // post first (dsv4_hc_post_f32), each thread writes and re-reads only its own columns
+    for (int col = tid; col < ncols; col += 1024) {
+        const float xv = SMA ? gfx906_hc_sma_combine(xr[col], sma_a[it * sx1 + col], sma_g[it]) : xr[col];
+        float sum = xv * w;
+        sum += rr[col];
+        pr[col] = sum;
+    }
+    // then rms_norm + mul on the post row, in rms_norm_f32's source form
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += 1024) {
+        const float xi = pr[col];
+        tmp += xi * xi;
+    }
+
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    const float * mr = mul + (int64_t) s * ncols;
+    for (int col = tid; col < ncols; col += 1024) {
+        const float v = scale * pr[col] * mr[col];
+        dst[off + col] = v;
+        if (yq != nullptr) {
+            gfx906_rms_emit_q8_1(yq, off + col, v);
+        }
+    }
+}
+
+// [gfx906-opt P3] host: SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL in one
+// launch; sma_* fold the shared-expert combine (b + a*sigmoid(g)) in as post's x.
+bool ggml_cuda_op_hc_post_rms_norm_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * inject, ggml_tensor * post,
+        const float s_in, const float s_out, const ggml_tensor * norm, ggml_tensor * mul_tensor, void * yq,
+        const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, const bool dry_run) {
+    const ggml_tensor * x   = sma_b != nullptr ? sma_b : post->src[0];
+    const ggml_tensor * res = post->src[1];
+    const ggml_tensor * w   = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t n_embd = post->ne[0];
+    const int64_t hc     = post->ne[1];
+    const int64_t nt     = post->ne[2];
+    if (post->src[3] != nullptr || norm->src[0] != post || hc != 4 || n_embd != 2560 || post->ne[3] != 1 ||
+            inject->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 ||
+            w->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
+            inject->ne[0] != hc || inject->ne[1] != nt || inject->nb[0] != sizeof(float) ||
+            x->ne[0] != n_embd || x->ne[1] != nt || x->nb[0] != sizeof(float) ||
+            res->ne[0] != n_embd || res->ne[1] != hc || res->ne[2] != nt || res->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(post) || !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(post, mul_tensor) ||
+            !ggml_is_contiguous(w) || w->ne[0] != n_embd || w->ne[1] != hc || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (sma_b != nullptr && (sma_a->type != GGML_TYPE_F32 || sma_g->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(sma_a, sma_b) || sma_a->nb[0] != sizeof(float) || sma_a->nb[1] != sma_b->nb[1] ||
+            sma_g->ne[0] != 1 || sma_g->ne[1] != nt || !ggml_is_contiguous(sma_g))) {
+        return false;
+    }
+    auto lo  = [](const ggml_tensor * t) { return (const char *) t->data; };
+    auto hi  = [](const ggml_tensor * t) { return (const char *) t->data + ggml_nbytes(t); };
+    auto ovl = [&](const ggml_tensor * a, const ggml_tensor * b) { return lo(a) < hi(b) && lo(b) < hi(a); };
+    // stream s of token it is one block: an output may sit exactly on the residual (same threads
+    // read and write each element) but not on x, inject or the shared-expert inputs, which every
+    // stream of the token reads
+    const bool res_same = res->nb[1] == (size_t) n_embd * sizeof(float) && res->nb[2] == (size_t) hc * n_embd * sizeof(float);
+    const ggml_tensor * shared_in[4] = { x, inject, sma_a, sma_g };
+    const int n_shared = sma_b != nullptr ? 4 : 2;
+    if (ovl(post, mul_tensor)) {
+        return false;
+    }
+    if (sma_b != nullptr && (ovl(inject, sma_a) || ovl(inject, sma_b) || ovl(inject, sma_g))) {
+        return false;
+    }
+    for (const ggml_tensor * o : { (const ggml_tensor *) post, (const ggml_tensor *) mul_tensor }) {
+        if (ovl(o, res) && !(lo(o) == lo(res) && res_same)) {
+            return false;
+        }
+        for (int k = 0; k < n_shared; k++) {
+            if (ovl(o, shared_in[k])) {
+                return false;
+            }
+        }
+    }
+    if (dry_run) {
+        return true;
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const bool sma = sma_b != nullptr;
+    auto kernel = sma ? hc_post_rms_norm_mul_q8_f32<4, true> : hc_post_rms_norm_mul_q8_f32<4, false>;
+    kernel<<<dim3(hc, nt), 1024, 0, ctx.stream()>>>(
+        (const float *) inject->data, inject->nb[1] / sizeof(float), (const float *) x->data, x->nb[1] / sizeof(float),
+        sma ? (const float *) sma_a->data : nullptr, sma ? (const float *) sma_g->data : nullptr,
+        (const float *) res->data, res->nb[1] / sizeof(float), res->nb[2] / sizeof(float),
+        (float *) post->data, s_in, s_out, (const float *) w->data, (float *) mul_tensor->data, (int) n_embd, eps, (block_q8_1 *) yq);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
