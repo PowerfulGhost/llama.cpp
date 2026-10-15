@@ -3861,33 +3861,38 @@ struct f32m_group {
 
 static std::vector<f32m_group> f32m_build_plan(const struct ggml_cgraph * cgraph) {
     std::vector<f32m_group> plan;
-    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> by_src1;
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, const ggml_tensor *>>> by_src1;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT || !ggml_cuda_f32_multi_ok(node) || node->ne[1] != 1) {
             continue;
         }
-        by_src1[node->src[1]].push_back(node);
+        by_src1[node->src[1]].push_back({i, node});
     }
     for (auto & [src1, members0] : by_src1) {
         if (members0.size() < 2) {
             continue;
         }
         f32m_group g{};
-        g.head = members0[0];
+        g.head = members0[0].second;
+        const int head_idx = members0[0].first;
         for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
-            if (k > 0 && members0[k]->src[0]->ne[0] != g.head->src[0]->ne[0]) {
+            // same liveness hazard as q8m: only group graph-adjacent members (see E8)
+            if (members0[k].first != head_idx + g.n) {
+                break;
+            }
+            if (k > 0 && members0[k].second->src[0]->ne[0] != g.head->src[0]->ne[0]) {
                 continue;
             }
-            bool aligned = (uintptr_t) g.head->src[1]->data % 16 == 0 && (uintptr_t) members0[k]->data % 16 == 0;
-            aligned &= (uintptr_t) members0[k]->src[0]->data % 16 == 0;
+            bool aligned = (uintptr_t) g.head->src[1]->data % 16 == 0 && (uintptr_t) members0[k].second->data % 16 == 0;
+            aligned &= (uintptr_t) members0[k].second->src[0]->data % 16 == 0;
             if (!aligned) {
                 continue;
             }
-            if (!ggml_is_contiguous(members0[k]->src[1])) {
+            if (!ggml_is_contiguous(members0[k].second->src[1])) {
                 continue;
             }
-            g.mms[g.n++] = members0[k];
+            g.mms[g.n++] = members0[k].second;
         }
         if (g.n >= 2) {
             plan.push_back(g);
@@ -3899,7 +3904,7 @@ static std::vector<f32m_group> f32m_build_plan(const struct ggml_cgraph * cgraph
 static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, const std::vector<int> & glu_consumed,
         bool glu_fusion_enabled) {
     std::vector<q8m_group> plan;
-    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> by_src1;
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, const ggml_tensor *>>> by_src1;
     if (getenv("GFX906_Q8_MULTI_DEBUG")) fprintf(stderr, "[q8m-build] n_nodes=%d\n", cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -3908,7 +3913,7 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
                 || !ggml_cuda_repack_multi_ok(node)) {   // same predicate incl. env off-switch
             continue;
         }
-        by_src1[node->src[1]].push_back(node);
+        by_src1[node->src[1]].push_back({i, node});
     }
     if (getenv("GFX906_Q8_MULTI_DEBUG")) {
         size_t qel = 0;
@@ -3921,18 +3926,26 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
         }
         if (getenv("GFX906_Q8_MULTI_DEBUG")) {
             fprintf(stderr, "[q8m-plan] src1=%p count=%zu :", (void*) src1, members0.size());
-            for (auto * m : members0) fprintf(stderr, " %s(ne0=%d ne1=%d)", m->name, (int)m->src[0]->ne[0], (int)m->src[0]->ne[1]);
+            for (auto & m : members0) fprintf(stderr, " %s@%d(ne0=%d ne1=%d)", m.second->name, m.first, (int)m.second->src[0]->ne[0], (int)m.second->src[0]->ne[1]);
             fprintf(stderr, "\n");
         }
         q8m_group g{};
-        g.head = members0[0];
-        const int64_t ne00 = members0[0]->src[0]->ne[0];
+        g.head = members0[0].second;
+        const int head_idx = members0[0].first;
+        const int64_t ne00 = members0[0].second->src[0]->ne[0];
         for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
-            if (k > 0 && members0[k]->src[0]->ne[0] != ne00) {
+            if (k > 0 && members0[k].second->src[0]->ne[0] != ne00) {
                 continue;
             }
-            // members must share src1 AND weight-device locality is implied by src1 sharing
-            g.mms[g.n++] = members0[k];
+            // [correctness] only ever group nodes that are adjacent in graph order.
+            // The grouped kernel writes every member at the head's position, which
+            // extends each member output's live range to the head. ggml's planner may
+            // reuse a non-adjacent member's output buffer for a tensor that is live
+            // in between, so early writes there corrupt unrelated state.
+            if (members0[k].first != head_idx + g.n) {
+                break;
+            }
+            g.mms[g.n++] = members0[k].second;
         }
         if (g.n >= 2) {
             plan.push_back(g);
@@ -3964,7 +3977,7 @@ static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_t
 
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
-    static const bool no_hc_norm = getenv("GFX906_HC_POST_NORM") == nullptr; // opt-in pending bit-parity root-cause
+    static const bool no_hc_norm = getenv("GFX906_HC_POST_NORM") == nullptr; // opt-in: not bitwise (see hc-up-pre.cuh)
     if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
         return 0;
     }
@@ -4918,7 +4931,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // (qwen4exp hc combine + the next hc mix norm): 6 launches -> 1
     if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
-        static const bool no_hcpn = getenv("GFX906_HC_POST_NORM") == nullptr; // opt-in pending bit-parity root-cause
+        static const bool no_hcpn = getenv("GFX906_HC_POST_NORM") == nullptr; // opt-in: not bitwise (see hc-up-pre.cuh)
         if (!no_hcpn) {
             const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
             if (n_hc > 0) {
@@ -4928,9 +4941,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // [gfx906-opt P3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
-    // (qwen4exp hc mix, single-token rows): 4 launches -> 1, bitwise per hc-up-pre.cu
+    // (qwen4exp hc mix, single-token rows): 4 launches -> 1, not bitwise (see hc-up-pre.cu)
     if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
-        static const bool no_hcup = getenv("GFX906_HC_UP_PRE") == nullptr; // opt-in pending bit-parity root-cause
+        static const bool no_hcup = getenv("GFX906_HC_UP_PRE") == nullptr; // opt-in: not bitwise (see hc-up-pre.cuh)
         ggml_tensor * silu = cgraph->nodes[i + 1];
         ggml_tensor * up   = cgraph->nodes[i + 2];
         ggml_tensor * rs   = cgraph->nodes[i + 3];
