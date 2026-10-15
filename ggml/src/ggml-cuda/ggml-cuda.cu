@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/q8_repack/repack.cuh"
+#include "gfx906-f32.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -3850,6 +3851,50 @@ struct q8m_group {
 // three separate launches for (gate, up, GLU), so grouping the two mat-vecs
 // there is still a win. The grouped kernel computes each row exactly like the
 // ungrouped one, so the outputs stay bitwise identical either way.
+// gfx906 F32 family: up to three MUL_MAT with F32 weights (K == 2560) sharing src1.
+struct f32m_group {
+    const ggml_tensor * head;
+    std::array<const ggml_tensor *, 3> mms;
+    int n;
+};
+
+static std::vector<f32m_group> f32m_build_plan(const struct ggml_cgraph * cgraph) {
+    std::vector<f32m_group> plan;
+    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> by_src1;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || !ggml_cuda_f32_multi_ok(node) || node->ne[1] != 1) {
+            continue;
+        }
+        by_src1[node->src[1]].push_back(node);
+    }
+    for (auto & [src1, members0] : by_src1) {
+        if (members0.size() < 2) {
+            continue;
+        }
+        f32m_group g{};
+        g.head = members0[0];
+        for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
+            if (k > 0 && members0[k]->src[0]->ne[0] != g.head->src[0]->ne[0]) {
+                continue;
+            }
+            bool aligned = (uintptr_t) g.head->src[1]->data % 16 == 0 && (uintptr_t) members0[k]->data % 16 == 0;
+            aligned &= (uintptr_t) members0[k]->src[0]->data % 16 == 0;
+            if (!aligned) {
+                continue;
+            }
+            if (!ggml_is_contiguous(members0[k]->src[1])) {
+                continue;
+            }
+            g.mms[g.n++] = members0[k];
+        }
+        if (g.n >= 2) {
+            plan.push_back(g);
+        }
+    }
+    return plan;
+}
+
 static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, const std::vector<int> & glu_consumed,
         bool glu_fusion_enabled) {
     std::vector<q8m_group> plan;
@@ -4877,6 +4922,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
 
+            // [gfx906 P2.2] F32 grouped mat-vec (GDN beta+alpha, router+gate)
+            std::vector<f32m_group> f32m_groups;
+            std::unordered_map<const ggml_tensor *, f32m_group *> f32m_member_of;
+            if (getenv("GFX906_F32_MULTI_OFF") == nullptr) {
+                f32m_groups = f32m_build_plan(cgraph);
+                for (auto & g : f32m_groups) {
+                    for (int k = 0; k < g.n; k++) {
+                        f32m_member_of[g.mms[k]] = &g;
+                    }
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 q8m_group * q8m_g = nullptr;
@@ -4945,6 +5002,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // [gfx906-opt P2] before any dispatch: this node will write its output range
                 q8x_invalidate(node);
+
+                // [gfx906 P2.2] F32 grouped mat-vec
+                if (!f32m_member_of.empty()) {
+                    auto it = f32m_member_of.find(node);
+                    if (it != f32m_member_of.end()) {
+                        if (node == it->second->head) {
+                            ggml_cuda_mul_mat_f_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(it->second->mms.data()), it->second->n);
+                        }
+                        continue;
+                    }
+                }
 
                 // gfx906 q8-multi: non-head members are already produced by the head's
                 // one grouped launch; head launches the group here.
