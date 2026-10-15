@@ -3707,7 +3707,7 @@ struct q8m_group {
 static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, const std::vector<int> & glu_consumed,
         bool glu_fusion_enabled) {
     std::vector<q8m_group> plan;
-    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> by_src1;
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, const ggml_tensor *>>> by_src1;
     if (getenv("GFX906_Q8_MULTI_DEBUG")) fprintf(stderr, "[q8m-build] n_nodes=%d\n", cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -3716,7 +3716,7 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
                 || !ggml_cuda_repack_multi_ok(node)) {   // same predicate incl. env off-switch
             continue;
         }
-        by_src1[node->src[1]].push_back(node);
+        by_src1[node->src[1]].push_back({i, node});
     }
     if (getenv("GFX906_Q8_MULTI_DEBUG")) {
         size_t qel = 0;
@@ -3729,18 +3729,26 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
         }
         if (getenv("GFX906_Q8_MULTI_DEBUG")) {
             fprintf(stderr, "[q8m-plan] src1=%p count=%zu :", (void*) src1, members0.size());
-            for (auto * m : members0) fprintf(stderr, " %s(ne0=%d ne1=%d)", m->name, (int)m->src[0]->ne[0], (int)m->src[0]->ne[1]);
+            for (auto & m : members0) fprintf(stderr, " %s@%d(ne0=%d ne1=%d)", m.second->name, m.first, (int)m.second->src[0]->ne[0], (int)m.second->src[0]->ne[1]);
             fprintf(stderr, "\n");
         }
         q8m_group g{};
-        g.head = members0[0];
-        const int64_t ne00 = members0[0]->src[0]->ne[0];
+        g.head = members0[0].second;
+        const int head_idx = members0[0].first;
+        const int64_t ne00 = members0[0].second->src[0]->ne[0];
         for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
-            if (k > 0 && members0[k]->src[0]->ne[0] != ne00) {
+            if (k > 0 && members0[k].second->src[0]->ne[0] != ne00) {
                 continue;
             }
-            // members must share src1 AND weight-device locality is implied by src1 sharing
-            g.mms[g.n++] = members0[k];
+            // [correctness] only ever group nodes that are adjacent in graph order.
+            // The grouped kernel writes every member at the head's position, which
+            // extends each member output's live range to the head. ggml's planner may
+            // reuse a non-adjacent member's output buffer for a tensor that is live
+            // in between, so early writes there corrupt unrelated state.
+            if (members0[k].first != head_idx + g.n) {
+                break;
+            }
+            g.mms[g.n++] = members0[k].second;
         }
         if (g.n >= 2) {
             plan.push_back(g);
