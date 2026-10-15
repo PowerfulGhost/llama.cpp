@@ -715,6 +715,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
+    // [gfx906-opt P2] q8_1 activation cache buffers: grow-only, parked on dtor
+    for (size_t k = 0; k < REPACK_XQ_CACHE_N; ++k) {
+        if (repack_xq[k].buf != nullptr) {
+            repack_xq_retired.push_back(repack_xq[k].buf);
+        }
+    }
+    for (void * p : repack_xq_retired) {
+        CUDA_CHECK(cudaFree(p));
+    }
 }
 
 
@@ -3526,6 +3535,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
 
+    // O7 differential switch: GGML_CUDA_FUSE_SKIP_OPS="MUL_MAT,RMS_NORM,SCALE,..."
+    // A fusion chain is rejected when ANY op named in the pattern (not just the
+    // head) appears in the list, so families can be carved outen one by one.
+    static const bool fuse_skip_active = getenv("GGML_CUDA_FUSE_SKIP_OPS") != nullptr;
+    if (fuse_skip_active) {
+        static const std::vector<std::string> skip_ops = []() {
+            std::vector<std::string> out;
+            const char * env = getenv("GGML_CUDA_FUSE_SKIP_OPS");
+            if (env == nullptr) {
+                return out;
+            }
+            std::string s = env;
+            size_t pos = 0;
+            while (pos <= s.size()) {
+                size_t sep = s.find_first_of(",;", pos);
+                if (sep == std::string::npos) sep = s.size();
+                std::string tok = s.substr(pos, sep - pos);
+                while (!tok.empty() && (tok.front() == ':' || tok.front() == ' ')) tok.erase(tok.begin());
+                while (!tok.empty() && (tok.back() == ':' || tok.back() == ' ')) tok.pop_back();
+                if (!tok.empty()) out.push_back(tok);
+                pos = sep + 1;
+            }
+            return out;
+        }();
+        if ([&]() {
+                for (auto op : ops) {
+                    const char * name = ggml_op_name(op);
+                    for (const auto & s : skip_ops) {
+                        if (s == name) return true;
+                    }
+                }
+                for (auto uop : unary_ops) {
+                    const char * name = ggml_unary_op_name(uop);
+                    if (name != nullptr) {
+                        for (const auto & s : skip_ops) {
+                            if (s == name) return true;
+                        }
+                    }
+                }
+                return false;
+            }()) {
+            return false;
+        }
+    }
+
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
         return std::equal(list1.begin(), list1.end(), list2.begin(), list2.end());
@@ -4687,6 +4741,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    cuda_ctx->graph_gen++;   // [gfx906-opt P2] per-eval generation for the q8_1 activation cache
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4871,9 +4926,32 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+
+            // [gfx906-opt P2] invalidate cached q8_1 activations overlapping a
+            // node's write range (producer-safe: never drop own entry).
+            const auto q8x_invalidate = [&](const ggml_tensor * n) {
+                if (n == nullptr || n->data == nullptr) return;
+                const char * lo = (const char *) n->data;
+                const char * hi = lo + ggml_nbytes(n);
+                for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+                    auto & e = cuda_ctx->repack_xq[k];
+                    if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+                    if (e.producer_nbytes == 0) continue;
+                    const char * elo = (const char *) e.producer_data;
+                    const char * ehi = elo + e.producer_nbytes;
+                    if (lo < ehi && elo < hi) e.gen = 0;
+                }
+            };
+
+                // [gfx906-opt P2] before any dispatch: this node will write its output range
+                q8x_invalidate(node);
+
                 // gfx906 q8-multi: non-head members are already produced by the head's
                 // one grouped launch; head launches the group here.
                 if (q8m_g) {
+                    for (int k = 0; k < q8m_g->n; ++k) {
+                        q8x_invalidate(q8m_g->mms[k]);
+                    }
                     if (node == q8m_g->head) {
                         ggml_cuda_mul_mat_repacked_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(q8m_g->mms.data()), q8m_g->n);
                     }
@@ -4883,6 +4961,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    // fused chains write multiple outputs: invalidate each
+                    for (int k = 1; k <= nodes_to_skip; ++k) {
+                        q8x_invalidate(cgraph->nodes[i + k]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",

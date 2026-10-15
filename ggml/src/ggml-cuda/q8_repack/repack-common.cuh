@@ -619,30 +619,91 @@ const uint8_t * repack_view_get_cached(
 // different model and hit a stale entry.
 void repack_view_cache_purge(int device, const void * base, size_t size);
 
-// Quantize src1 into Q8_1 rows, reusing the graph-wide activation cache when the
-// same activation was already quantized to this exact layout. One activation
-// feeds several matmuls back to back - q/k/v off one attention norm, router and
-// routed gate/up off one ffn norm - and each re-quantized its own copy, so the
-// launch count tracked the matmul count exactly. quantize_row_q8_1_cuda ignores
-// type_src0 and always writes the plain row layout, so variant 0 is the same
-// layout the canonical mat-vec caches under and the two share entries. The MoE
-// sites pass the rows flattened as (n_cols, 1, 1) where the dense sites pass
-// (ne11, ne12, ne13). That is still the same bytes: the kernel writes
-// i_cont = ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0, which is contiguous either way,
-// and it can only collide in the cache when the strides and the size already
-// match, which is the contiguous case where both walk src1 identically.
-// Fusing the quantize into the mat-vec instead is the wrong shape: it is a
-// shared producer, and making every block re-quantize the row cost 42 percent.
+// Quantize src1 into Q8_1 rows. P2: on the main stream the result is cached
+// graph-wide (same activation feeds q/k/v / gate/up and the shared expert / the
+// MoE router path); entries are reused while gen == graph_gen and no node has
+// written the backing range (range-checked by the graph loop). Reuse falls
+// back to a fresh quantize when the cache is disabled, outside graph capture
+// with a grow, or on geometry mismatch.
 static inline block_q8_1 * repack_quantize_src1_q8_1(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         int64_t ne10, int64_t ne10_padded, int64_t s11, int64_t s12, int64_t s13,
         int64_t nrows, int64_t ne2, int64_t ne3, size_t nblocks,
         ggml_cuda_pool_alloc<block_q8_1> & fallback, cudaStream_t stream) {
-    // [gfx906-opt step 1] The fork's graph-wide q8_1 activation cache (a separate feature with its
-    // own benefit) is not ported yet, so every call quantizes into its own fallback buffer.
-    fallback.alloc(ctx.pool(), nblocks);
-    block_q8_1 * dstq = fallback.get();
-    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, dstq,
-        src0->type, ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
-    return dstq;
+    static const bool disabled = getenv("GFX906_REPACK_NO_XQ_CACHE") != nullptr;
+
+    auto quantize_into = [&](void * out) {
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, (block_q8_1 *) out,
+            src0->type, ne10, s11, s12, s13, ne10_padded, nrows, ne2, ne3, stream);
+    };
+
+    if (disabled || ctx.curr_stream_no != 0 || nblocks == 0 || src1->nb[0] != sizeof(float)) {
+        fallback.alloc(ctx.pool(), nblocks);
+        block_q8_1 * dstq = fallback.get();
+        quantize_into(dstq);
+        return dstq;
+    }
+
+    bool capturing = false;
+    {
+#if defined(GGML_USE_HIP)
+        hipStreamCaptureStatus st;
+        if (hipStreamIsCapturing(stream, &st) == hipSuccess) {
+            capturing = st != hipStreamCaptureStatusNone;
+        }
+#else
+        cudaStreamCaptureStatus st;
+        if (cudaStreamIsCapturing(stream, &st) == cudaSuccess) {
+            capturing = st != cudaStreamCaptureStatusNone;
+        }
+#endif
+    }
+
+    auto & cache = ctx.repack_xq;
+    const size_t bytes = (size_t) nblocks * sizeof(block_q8_1);
+
+    // exact reuse: same backing pointer, same generation, same geometry/strides
+    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+        auto & e = cache[k];
+        if (e.gen != ctx.graph_gen || e.data != src1->data || e.bytes != bytes) {
+            continue;
+        }
+        bool geo = memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 &&
+                   e.nb[1] == (size_t) s11 * sizeof(float) &&
+                   e.nb[2] == (size_t) s12 * sizeof(float) &&
+                   e.nb[3] == (size_t) s13 * sizeof(float) && e.bytes == bytes;
+        if (geo) {
+            return (block_q8_1 *) e.buf;
+        }
+    }
+
+    // fresh entry (ring slot); grow only outside capture
+    auto & e = cache[ctx.repack_xq_next];
+    ctx.repack_xq_next = (ctx.repack_xq_next + 1) % ggml_backend_cuda_context::REPACK_XQ_CACHE_N;
+    e.gen = 0;
+    if (e.cap < bytes) {
+        if (capturing) {
+            fallback.alloc(ctx.pool(), nblocks);
+            block_q8_1 * dstq = fallback.get();
+            quantize_into(dstq);
+            return dstq;
+        }
+        if (e.buf != nullptr) {
+            ctx.repack_xq_retired.push_back(e.buf);
+        }
+        CUDA_CHECK(cudaMalloc(&e.buf, bytes));
+        e.cap = bytes;
+    }
+    quantize_into(e.buf);
+    e.gen = ctx.graph_gen;
+    e.data = src1->data;
+    memcpy(e.ne, src1->ne, sizeof(e.ne));
+    e.nb[1] = (size_t) s11 * sizeof(float);
+    e.nb[2] = (size_t) s12 * sizeof(float);
+    e.nb[3] = (size_t) s13 * sizeof(float);
+    e.bytes = bytes;
+    e.producer = src1;
+    e.producer_data = src1->data;
+    e.producer_nbytes = (size_t) ggml_nbytes(src1);
+    return (block_q8_1 *) e.buf;
 }

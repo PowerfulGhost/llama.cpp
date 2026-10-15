@@ -1448,6 +1448,28 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // [gfx906-opt P2] graph-wide q8_1 activation cache: ring of persistent
+    // cudaMalloc'd quantized-activation copies, reused while gen == graph_gen
+    // and no node has written the backing range. Persistent buffers keep
+    // captured graphs address-stable; outgrown ones are parked until dtor.
+    struct repack_xq_cache_entry {
+        uint64_t     gen      = 0;
+        const void * data     = nullptr;
+        int64_t      ne[4]    = {};
+        size_t       nb[4]    = {};
+        size_t       bytes    = 0;
+        const void * producer = nullptr;
+        const void * producer_data = nullptr;
+        size_t       producer_nbytes = 0;
+        void *       buf      = nullptr;
+        size_t       cap      = 0;
+    };
+    static constexpr size_t REPACK_XQ_CACHE_N = 16;
+    uint64_t graph_gen = 0;
+    repack_xq_cache_entry repack_xq[REPACK_XQ_CACHE_N];
+    size_t repack_xq_next = 0;
+    std::vector<void *> repack_xq_retired;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
