@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/gfx906-repack/repack.cuh"
+#include "ggml-cuda/hc-up-pre.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -3758,6 +3759,18 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
     return plan;
 }
 
+// [gfx906-opt P3] byte-range overlap of two tensors' storage
+static bool ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b || a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+    const char * alo = (const char *) a->data;
+    const char * ahi = alo + ggml_nbytes(a);
+    const char * blo = (const char *) b->data;
+    const char * bhi = blo + ggml_nbytes(b);
+    return alo < bhi && blo < ahi;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4608,6 +4621,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
     }
+
+    // [gfx906-opt P3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
+    // (qwen4exp hc mix, single-token rows): 4 launches -> 1, bitwise per hc-up-pre.cu
+    if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
+        static const bool no_hcup = getenv("GFX906_NO_HC_UP_PRE") != nullptr;
+        ggml_tensor * silu = cgraph->nodes[i + 1];
+        ggml_tensor * up   = cgraph->nodes[i + 2];
+        ggml_tensor * rs   = cgraph->nodes[i + 3];
+        ggml_tensor * pre  = cgraph->nodes[i + 4];
+        if (!no_hcup && silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+                silu->src[0] == node && up->op == GGML_OP_MUL_MAT && rs->op == GGML_OP_RESHAPE &&
+                rs->src[0] == up && pre->op == GGML_OP_DSV4_HC_PRE && pre->src[1] == rs &&
+                // the RESHAPE is a view: plain use counts (furnace semantics); the chain's
+                // other consumers are audited inside ggml_cuda_hc_up_pre_ok
+                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                (silu->flags & GGML_TENSOR_FLAG_COMPUTE) && (up->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (pre->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_hc_up_pre_ok(node, silu, up, pre) &&
+                // tailored liveness check (the fused kernel writes pre and reads lo/xn;
+                // skipped outputs and weights may alias anything safely)
+                node->src[0] && !ranges_overlap(node->src[0], pre) &&
+                !ranges_overlap(pre->src[0], pre)) {
+            void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, pre);
+            ggml_cuda_hc_up_pre(*cuda_ctx, node, up, pre, yq);
+            static int hdbg_n = getenv("GFX906_HCUP_DEBUG") ? 0 : 6;
+            if (hdbg_n++ < 6) {
+                fprintf(stderr, "[gfx906-hcup] fused: pre=%s ntok=%lld yq=%d\n", pre->name, (long long) pre->ne[1], yq != nullptr);
+            }
+            return 4;
+        }
+    }
+
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
