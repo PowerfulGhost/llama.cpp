@@ -4722,6 +4722,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 
+    // [gfx906-opt P3.4] SCALE -> SILU (hc mix outside hc_up_pre's token window)
+    if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
+            (getenv("GFX906_NO_SCALE_SILU") == nullptr) && node->src[0]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
+            ggml_nelements(node->src[0]) == ggml_nelements(cgraph->nodes[i + 1]) &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            !ranges_overlap(node->src[0], cgraph->nodes[i + 1])) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {

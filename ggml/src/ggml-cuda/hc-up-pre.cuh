@@ -17,3 +17,6 @@ void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * sc
 // Returns nullptr when no such consumer exists, or under stream capture when a buffer
 // would have to grow (the consumer then quantizes normally - correctness is unaffected).
 void * ggml_cuda_hc_up_pre_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t);
+
+// [gfx906-opt P3.4] SCALE -> SILU in one launch (wider hc mix batches)
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node);
