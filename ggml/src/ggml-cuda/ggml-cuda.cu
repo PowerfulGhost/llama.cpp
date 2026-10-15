@@ -3764,6 +3764,21 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
 // sma_*: the block output is the shared-expert combine SIGMOID -> MUL -> ADD, folded in
 // (the caller checks that DSV4_HC_POST reads it). Returns the number of nodes after i it
 // covered, 0 = not fused. dry: only report whether it would run (nothing launched).
+// [gfx906-opt P3.3] out-of-order invalidation for a node evaluated ahead of its place
+static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * n) {
+    if (n == nullptr || n->data == nullptr) return;
+    const char * lo = (const char *) n->data;
+    const char * hi = lo + ggml_nbytes(n);
+    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+        auto & e = cuda_ctx->repack_xq[k];
+        if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+        if (e.producer_nbytes == 0) continue;
+        const char * elo = (const char *) e.producer_data;
+        const char * ehi = elo + e.producer_nbytes;
+        if (lo < ehi && elo < hi) e.gen = 0;
+    }
+}
+
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
     static const bool no_hc_norm = getenv("GFX906_NO_HC_POST_NORM") != nullptr;
