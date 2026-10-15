@@ -778,3 +778,54 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* [gfx906-opt P2] fused sigmoid -> mul -> add: y = b + a*sigmoid(g), the gate g
+ * converted to fixed values (qwen4exp hyperconnection / shared-expert interpretation
+ * boundary combine). Row-major elementwise; per-element arithmetic in the same
+ * order as the three solo launches -> bit-identical. */
+static __global__ void sigmoid_mul_add_kernel(
+        const int n_cols, const int n_rows,
+        const float * __restrict__ gate,   // [n_rows]
+        const float * __restrict__ a,
+        const float * __restrict__ b,
+        float * __restrict__ dst) {
+        // no FMA contraction: match the solo-launch rounding sequence (mul, then add)
+        #pragma clang fp contract(off)
+        for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
+            i < (int64_t) n_cols * n_rows;
+            i += (int64_t) gridDim.x * blockDim.x) {
+        const int row = (int) (((int64_t) i / n_cols) % n_rows);
+        const float g = gate[row];
+        const float sig = 1.0f / (1.0f + expf(-g));
+        const float m   = a[i] * sig;
+        dst[i] = b[i] + m;
+    }
+}
+
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx,
+        ggml_tensor * gate, ggml_tensor * a, ggml_tensor * b, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_is_contiguous_1(gate) && gate->nb[0] == ggml_element_size(gate));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    GGML_ASSERT(ggml_are_same_shape(a, dst) && ggml_are_same_shape(b, dst));
+    GGML_ASSERT(gate->ne[0] == 1 && gate->ne[1] == dst->ne[1]);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
+
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne = ggml_nelements(dst);
+    int64_t k = 0;
+    const int id = ggml_cuda_get_device();
+    const int64_t nt = (int64_t) ggml_cuda_info().devices[id].nsm * 4 * CUDA_SIGMOID_BLOCK_SIZE;
+    while (k < ne) {
+        const int64_t wk = std::min<int64_t>(nt, ne - k);
+        sigmoid_mul_add_kernel<<<(int)((wk + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE), CUDA_SIGMOID_BLOCK_SIZE, 0, stream>>>(
+            (int) dst->ne[0], (int) dst->ne[1],
+            (const float *) gate->data,
+            (const float *) a->data + k,
+            (const float *) b->data + k,
+            (float *) dst->data + k);
+        k += wk;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

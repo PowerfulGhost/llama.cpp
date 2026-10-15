@@ -4376,6 +4376,54 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // [gfx906-opt P2] SIGMOID -> MUL -> ADD: b + a*sigmoid(g), the gate g one
+    // value per row (shared-expert gate / hyperconnection combine). 3 launches -> 1,
+    // same intra-element arithmetic order (no FMA contraction) -> bit-identical.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
+        static const bool no_sma = getenv("GFX906_SMA_FUSION_OFF") != nullptr;
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * g = node->src[0];
+        if (!no_sma && mul->op == GGML_OP_MUL && add->op == GGML_OP_ADD &&
+                (mul->flags & GGML_TENSOR_FLAG_COMPUTE) && (add->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (mul->src[0] == node || mul->src[1] == node) && (add->src[0] == mul || add->src[1] == mul) &&
+                ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, i + 1, 1)) {
+            const ggml_tensor * a = mul->src[0] == node ? mul->src[1] : mul->src[0];
+            const ggml_tensor * b = add->src[0] == mul  ? add->src[1] : add->src[0];
+            const bool types = g->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32;
+            if (types && add->ne[1] == 1 && a != node && b != mul && g->ne[0] == 1 && ggml_is_contiguous(g) &&
+                    ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
+                    ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                    ggml_is_contiguous(add) &&
+                    // tailored memory check (the generic checker vetoes any
+                    // dead-input chunk overlap; the fused kernel only needs
+                    // its live operands to stay out of dst's storage):
+                    [&]() {
+                        static const bool no_custom_mem = getenv("GFX906_SMA_NO_CUSTOM_MEM") != nullptr;
+                        if (no_custom_mem) {
+                            const int out_nodes[] = { i + 2 };
+                            return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1);
+                        }
+                        const auto ov = [](const ggml_tensor * x, const ggml_tensor * x2) {
+                            const int64_t s1 = (int64_t) x->data,  e1 = s1 + ggml_nbytes(x);
+                            const int64_t s2 = (int64_t) x2->data, e2 = s2 + ggml_nbytes(x2);
+                            return (s2 <= s1 && s1 < e2) || (s1 <= s2 && s2 < e1);
+                        };
+                        // same-base in-place (dst aliases b element-wise) is safe:
+                        // only element i reads b[i] before writing dst[i]
+                        const bool b_alias = b->data == add->data;
+                        const bool ok3 = !ov(a, add) && (b_alias || !ov(b, add)) && !ov(g, add);
+                        return ok3;
+                    }()) {
+                                ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, (ggml_tensor *) g,
+                        (ggml_tensor *) a, (ggml_tensor *) b, add);
+                GGML_LOG_INFO("[gfx906-sma] fused sigmoid-mul-add: g=%s a=%s b=%s dst=%s\n", g->name, a->name, b->name, add->name);
+                return 2;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
