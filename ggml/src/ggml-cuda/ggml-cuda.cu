@@ -3995,6 +3995,12 @@ struct gfx906_hc_dbg {
     long hcup_candidates = 0;  // SCALE->SILU->MM(up)->RESHAPE->HC_PRE structural pattern matched
     long hcup_hit        = 0;  // full gate passed, fused kernel launched
     long hcpn_candidates = 0;  // hc-post-shaped site where try_hc_post_norm was invoked
+    long v_struct  = 0;  // op-chain/shape mismatch on the 6-node pattern
+    long v_uses    = 0;  // use-count veto (post/norm nodes have extra consumers)
+    long v_stride  = 0;  // ggml_are_same_stride(sc1->src[0], sc2) about
+    long v_flags   = 0;  // COMPUTE flags veto
+    long v_launch  = 0;  // launcher (op_hc_post_rms_norm_q8) shape/emit veto
+    long v_struct_printed = 0; // one-shot chain dumps under GFX906_HC_DEBUG
     long hcpn_hit        = 0;  // post-norm chain fused
     long hcsma_hit       = 0;  // sma variant with hc fold
     long hcsma_candidates = 0; // sma-shaped sites whose hc-fold pattern missed
@@ -4009,13 +4015,15 @@ static void gfx906_hc_dbg_flush() {
     }    if (g_hc_dbg.hcup_candidates || g_hc_dbg.hcpn_candidates || g_hc_dbg.hcup_hit ||
         g_hc_dbg.hcpn_hit || g_hc_dbg.hcsma_hit || g_hc_dbg.hcsma_candidates || g_hc_dbg.scsilu_hit || g_hc_dbg.emits) {
         fprintf(stderr,
-                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma cand=%ld hit=%ld | scsilu=%ld | emits=%ld\n",
+                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma cand=%ld hit=%ld | scsilu=%ld | emits=%ld | hcpn-veto struct=%ld uses=%ld stride=%ld flags=%ld launch=%ld\n",
                 g_hc_dbg.hcup_candidates, g_hc_dbg.hcup_hit,
                 g_hc_dbg.hcpn_candidates, g_hc_dbg.hcpn_hit,
-                g_hc_dbg.hcsma_candidates, g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits);
+                g_hc_dbg.hcsma_candidates, g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits,
+                g_hc_dbg.v_struct, g_hc_dbg.v_uses, g_hc_dbg.v_stride, g_hc_dbg.v_flags, g_hc_dbg.v_launch);
     }
     g_hc_dbg = {};
 }
+
 static bool g_hc_dbg_enabled() {
     static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
     return on;
@@ -4030,7 +4038,8 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
     if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
         return 0;
     }
-    ++g_hc_dbg.hcpn_candidates;
+    // NOTE: candidates are counted at the dispatch branch (main) or inside the sma probe,
+    // so counting them here as well would double-count main-branch sites.
     ggml_tensor * sc1  = cgraph->nodes[i];
     ggml_tensor * sig  = cgraph->nodes[i + 1];
     ggml_tensor * sc2  = cgraph->nodes[i + 2];
@@ -4047,32 +4056,59 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
     const float s_out = ggml_get_op_params_f32(sc2, 0);
     if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
             sig->src[0] != sc1 || sc2->src[0] != sig || sc2->op != GGML_OP_SCALE ||
-            post->op != GGML_OP_DSV4_HC_POST || post->src[2] != sc2 ||
-            !ggml_node_has_n_uses(cgraph, i + 2, 1) ||
-            norm->op != GGML_OP_RMS_NORM || norm->src[0] != post || !ggml_node_has_n_uses(cgraph, i + 4, 1) ||
-            mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm) ||
-            !(post->flags & GGML_TENSOR_FLAG_COMPUTE) || !(norm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-            !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_are_same_stride(sc1->src[0], sc2)) {
+            post->op != GGML_OP_DSV4_HC_POST || post->src[2] != sc2) {
+        ++g_hc_dbg.v_struct;
+        if (g_hc_dbg_enabled() && g_hc_dbg.v_struct_printed++ < 4) {
+            fprintf(stderr, "[gfx906-hcpn-struct] i=%d chain: %s(%s) %s(%s src=%s) %s(%s) %s(%s src2=%s) %s %s\n",
+                    i, ggml_op_desc(sc1), sc1->name,
+                    ggml_op_desc(sig), sig->name, ggml_op_desc(sig->src[0]),
+                    ggml_op_desc(sc2), sc2->name,
+                    ggml_op_desc(post), post->name, post->src[2] ? ggml_op_desc(post->src[2]) : "null",
+                    ggml_op_desc(norm), ggml_op_desc(mul));
+        }
+        return 0;
+    }
+    if (!ggml_node_has_n_uses(cgraph, i + 2, 1) || !ggml_node_has_n_uses(cgraph, i + 4, 1)) {
+        ++g_hc_dbg.v_uses;
+        return 0;
+    }
+    if (norm->op != GGML_OP_RMS_NORM || norm->src[0] != post || mul->op != GGML_OP_MUL ||
+            (mul->src[0] != norm && mul->src[1] != norm)) {
+        ++g_hc_dbg.v_struct;
+        return 0;
+    }
+    if (!(post->flags & GGML_TENSOR_FLAG_COMPUTE) || !(norm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(mul->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        ++g_hc_dbg.v_flags;
+        return 0;
+    }
+    if (!ggml_are_same_stride(sc1->src[0], sc2)) {
+        ++g_hc_dbg.v_stride;
         return 0;
     }
     // the launcher checks which overlaps of outputs and inputs its kernel tolerates
     if (dry) {
-        return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
+        const int r = ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
+        if (!r) {
+            ++g_hc_dbg.v_launch;
+        }
+        return r;
     }
     void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, mul);
-    if (ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
-        return 5;
-    }
-    // the q8 emit slot was claimed before the launcher vetoed: never-written q8 in the
-    // ring must not survive (a later consumer whose pool range aliases mul would take a
-    // false cache hit); the per-node invalidation skips its own producer
-    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
-        auto & e = cuda_ctx->repack_xq[k];
-        if (e.gen == cuda_ctx->graph_gen && (e.producer == mul || (mul->data && e.data == mul->data))) {
-            e.gen = 0;
+    if (!ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
+        ++g_hc_dbg.v_launch;
+        // the q8 emit slot was claimed before the launcher vetoed: never-written q8 in the
+        // ring must not survive (a later consumer whose pool range aliases mul would take a
+        // false cache hit); the per-node invalidation skips its own producer
+        for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+            auto & e = cuda_ctx->repack_xq[k];
+            if (e.gen == cuda_ctx->graph_gen && (e.producer == mul || (mul->data && e.data == mul->data))) {
+                e.gen = 0;
+            }
         }
+        return 0;
     }
-    return 0;
+    return 5;
 }
 
 // [gfx906-opt P3] byte-range overlap of two tensors' storage
