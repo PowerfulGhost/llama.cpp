@@ -87,7 +87,29 @@ static __global__ void __launch_bounds__(256) hc_up_pre_f32(
         db[k] = d_plane[u];
     }
 
-    for (int i = t; i < HC_UP_K; i += blockDim.x) {
+    // [P3.5 fix, e10] per-32-value-group quantization: each warp must own exactly one
+    // 32-value QK8_1 block. The original loop (i = t; i < 320; i += 256) let lane t carry
+    // a value from block (t/32) AND from block (t/32 + 8) in the same warp reduction, so
+    // the amax/sum of 8 of the 10 blocks were mixed pairwise: the fused gate diverged
+    // from canonical (E7's unresolved last-bit mismatch), and any emitted q8_1 failed a
+    // canonical-quantize comparison (caught by GFX906_HC_EMIT_VALIDATE on e10).
+    // Pass 1: values 0..255 = blocks 0..7 (one per warp, lanes aligned to block lanes).
+    for (int i = t; i < 256; i += blockDim.x) {
+        const float v = ggml_cuda_op_silu_single(scale * lo[i] + bias);
+        float amax = fabsf(v);
+        float sum  = v;
+        amax = warp_reduce_max(amax);
+        sum  = warp_reduce_sum(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+        aq[i / QK8_1].qs[i % QK8_1] = q;
+        if (i % QK8_1 == 0) {
+            aq[i / QK8_1].ds = make_half2(d, sum);
+        }
+    }
+    // Pass 2: values 256..319 = blocks 8..9 (only threads t<64; warps 0 and 1).
+    if (t < 64) {
+        const int i = 256 + t;
         const float v = ggml_cuda_op_silu_single(scale * lo[i] + bias);
         float amax = fabsf(v);
         float sum  = v;
