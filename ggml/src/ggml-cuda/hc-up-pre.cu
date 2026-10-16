@@ -1,15 +1,43 @@
 #include "hc-up-pre.cuh"
+#include <cstring>
+#include <cstdlib>
 #include "unary.cuh"
+#include "quantize.cuh"
 #include "q8_repack/repack.cuh"
 #include "ggml-impl.h"
 #include "../ggml-backend-impl.h"
 
+// [gfx906-opt P3.5] see ggml-cuda.cu gfx906_env_on: tolerant opt-in parsing so "VAR=0"
+// never enables (the original `getenv(X)!=nullptr` check made that a footgun; E7 notes).
+static bool hc_env_on(const char * name, bool def = false) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0);
+}
+
 // [gfx906-opt P3] qwen4exp hyper-connection mix, after the down projection (one token):
 //   SCALE -> SILU -> MUL_MAT(hc up, repacked Q8_0, K = 320) -> RESHAPE -> DSV4_HC_PRE(gated, 4 streams)
 // A block quantizes silu(s*lo + b) itself (silu + fp32 scale arithmetic), computes the 4 stream rows of
-// 32 output dims (the repacked flat q8_0 dot/sum order) and mixes them as our dsv4_hc_pre kernel does,
-// so the result is bitwise that of the four launches it replaces (when no q8_1 emit is requested).
+// 32 output dims (the repacked flat q8_0 dot/sum order) and mixes them as our dsv4_hc_pre kernel does.
 // Ported from furnace ggml-cuda/repack-gcn.cu hc_up_pre_f32 (same element order as the launches above).
+//
+// NON-BITWISE STATUS (E7/E8 closing, 2026-10-15):
+//   - The fused chain reads the scale bias from op_params[1] exactly like the solo
+//     ggml_cuda_op_scale kernel, so that known divergence source is copied byte-for-byte.
+//   - The residual sensitivity: this kernel's dot product accumulates each repacked Q8_0
+//     weight block in its whole 32-value order, while the canonical
+//     mul_mat_vec_q8_0_repacked path splits every block into two 16-value halves and
+//     reduces with a 64-lane DPP butterfly. The two are mathematically equal but round
+//     differently, so greedy generations may diverge from the canonical path (~token 60
+//     on some prompts). Removing the difference would require restructuring this kernel
+//     to the canonical lane order, which costs the fusion's benefit -- so the whole HC
+//     chain ships permanently opt-in (GFX906_HC_UP_PRE / GFX906_HC_POST_NORM /
+//     GFX906_SCALE_SILU; all read through the tolerant parser, see hc_env_on).
+//   - Per-eval hit/veto tallies: GFX906_HC_DEBUG=1 (see ggml-cuda.cu g_hc_dbg).
+//   - Where the fused kernel writes yq it must equal a canonical quantize_q8_1 over the
+//     F32 result it just produced; GFX906_HC_EMIT_VALIDATE=1 checks that at run time.
 static constexpr int HC_UP_K  = 320;
 static constexpr int HC_UP_NB = HC_UP_K/32;
 static constexpr int HC_UP_HC = 4;
@@ -133,7 +161,10 @@ static __global__ void __launch_bounds__(256) hc_up_pre_f32(
 // host side ---------------------------------------------------------------
 
 bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre) {
-    static const bool disabled = getenv("GFX906_NO_HC_UP_PRE") != nullptr;
+    // [gfx906-opt P3.5] single opt-in source now: on/off is GFX906_HC_UP_PRE
+    // (tolerant parser; the legacy GFX906_NO_HC_UP_PRE spelling is retired so there
+    // is exactly one way to disable)
+    static const bool disabled = !hc_env_on("GFX906_HC_UP_PRE");
     const ggml_tensor * w  = up->src[0];
     const ggml_tensor * lo = scale->src[0];
     if (disabled || !w->buffer || !ggml_backend_buft_is_cuda_repack(w->buffer->buft) || w->type != GGML_TYPE_Q8_0 ||
@@ -171,10 +202,62 @@ void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * sc
         (const float *) xn->data, xn->nb[1] / sizeof(float), pre_scale, (float *) pre->data, (block_q8_1 *) yq, n_embd,
         xn->nb[2] / sizeof(float));
     CUDA_CHECK(cudaGetLastError());
+
+    // [gfx906-opt P3.5] emit honesty audit (GFX906_HC_EMIT_VALIDATE=1): the q8_1 the fused
+    // kernel wrote must equal a canonical quantize_q8_1 over the same F32 values. On any
+    // non-captured evaluation, re-quantize pre into scratch and compare byte-for-byte.
+    // This is a debug gate, not part of the shipped decode path.
+    if (yq != nullptr && hc_env_on("GFX906_HC_EMIT_VALIDATE")) {
+        bool capturing = false;
+#if defined(GGML_USE_HIP)
+        hipStreamCaptureStatus st;
+        if (hipStreamIsCapturing(ctx.stream(), &st) == hipSuccess) {
+            capturing = st != hipStreamCaptureStatusNone;
+        }
+#else
+        cudaStreamCaptureStatus st;
+        if (cudaStreamIsCapturing(ctx.stream(), &st) == cudaSuccess) {
+            capturing = st != cudaStreamCaptureStatusNone;
+        }
+#endif
+        if (!capturing) {
+            const size_t bytes = (size_t) ggml_nelements(pre)/QK8_1 * sizeof(block_q8_1);
+            static void * ref   = nullptr;   // scratch: canonical quantize target
+            static void * fused = nullptr;   // scratch: copy of what the fused kernel wrote
+            static size_t cap   = 0;
+            if (cap < bytes) {
+                if (ref)   CUDA_CHECK(cudaFree(ref));
+                if (fused) CUDA_CHECK(cudaFree(fused));
+                CUDA_CHECK(cudaMalloc(&ref,   bytes));
+                CUDA_CHECK(cudaMalloc(&fused, bytes));
+                cap = bytes;
+            }
+            quantize_row_q8_1_cuda((const float *) pre->data, nullptr, ref, GGML_TYPE_F32,
+                    pre->ne[0], pre->nb[1]/sizeof(float), 0, 0, pre->ne[0], pre->ne[1], 1, 1, ctx.stream());
+            CUDA_CHECK(cudaMemcpyAsync(fused, yq, bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+            static std::vector<char> ref_h, fused_h;
+            ref_h.resize(bytes); fused_h.resize(bytes);
+            CUDA_CHECK(cudaMemcpy(ref_h.data(),   ref,   bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(fused_h.data(), fused, bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            if (memcmp(ref_h.data(), fused_h.data(), bytes) != 0) {
+                static int n_rep = 0;
+                if (n_rep++ < 8) {
+                    fprintf(stderr, "[gfx906-hcup] EMIT MISMATCH: fused q8_1 != canonical quantize (pre=%s, %zu bytes)\n",
+                            pre->name, bytes);
+                }
+            } else {
+                static int n_ok = 0;
+                if (n_ok++ < 4) {
+                    fprintf(stderr, "[gfx906-hcup] emit validated (%s, %zu bytes)\n", pre->name, bytes);
+                }
+            }
+        }
+    }
 }
 
 void * ggml_cuda_hc_up_pre_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t) {
-    static const bool disabled = getenv("GFX906_NO_Q8_EMIT") != nullptr;
+    static const bool disabled = hc_env_on("GFX906_NO_Q8_EMIT"); // off-switch, tolerant parse
     if (disabled || !cgraph || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->data == nullptr ||
             ggml_nelements(t) % QK8_1 != 0) {
         return nullptr;
