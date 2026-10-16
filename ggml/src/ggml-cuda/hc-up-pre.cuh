@@ -10,7 +10,7 @@
 // with a DPP butterfly. The two orders round differently at the last bit, so greedy output can
 // diverge (measured: a normal technical prompt forks around token ~60; degenerate repeated text
 // forks earlier). Numerically the model stays sane: PPL +0.5% relative, inside the +/-5% noise band.
-// Off-switch: GFX906_NO_HC_UP_PRE=1.
+// Off-switch: GFX906_HC_UP_PRE=0 (tolerant off), GFX906_NO_HC_UP_PRE=1 (legacy).
 
 bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre);
 void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * up,

@@ -4023,7 +4023,10 @@ static bool g_hc_dbg_enabled() {
 
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
-    const bool no_hc_norm = !gfx906_env_on("GFX906_HC_POST_NORM"); // opt-in: not bitwise (see hc-up-pre.cuh)
+    // [gfx906-opt P4 default-on] E10-b paired benches: ①+② = tg128 36.48 -> 39.03 (+7.0%),
+    // PPL delta within ±1σ; the single non-bitwise site is pinned to ① hc_up_pre's F32
+    // rounding order (permanent, opt-out via GFX906_HC_* = 0/off). Defaults now ship on.
+    const bool no_hc_norm = !gfx906_env_on("GFX906_HC_POST_NORM", true);
     if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
         return 0;
     }
@@ -4996,7 +4999,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // (qwen4exp hc combine + the next hc mix norm): 6 launches -> 1
     if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
-        static const bool no_hcpn = !gfx906_env_on("GFX906_HC_POST_NORM"); // opt-in: not bitwise (see hc-up-pre.cuh)
+        static const bool no_hcpn = !gfx906_env_on("GFX906_HC_POST_NORM", true); // default on (non-bitwise site = ① only; see T12 card)
         if (!no_hcpn) {
             ++g_hc_dbg.hcpn_candidates;
             const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
@@ -5016,7 +5019,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // hc-post chain) must not be masked: hc_up_pre runs as its own branch, and its veto on
     // shape/liveness is what turns into a canonical-chain fallback.
     if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
-        static const bool no_hcup = !gfx906_env_on("GFX906_HC_UP_PRE"); // opt-in: not bitwise (see hc-up-pre.cuh)
+        static const bool no_hcup = !gfx906_env_on("GFX906_HC_UP_PRE", true); // default on (E10-b: +4.1% alone; non-bitwise pinned single site)
         ggml_tensor * silu = cgraph->nodes[i + 1];
         ggml_tensor * up   = cgraph->nodes[i + 2];
         ggml_tensor * rs   = cgraph->nodes[i + 3];

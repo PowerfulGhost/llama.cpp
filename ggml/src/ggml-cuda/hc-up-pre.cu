@@ -183,10 +183,10 @@ static __global__ void __launch_bounds__(256) hc_up_pre_f32(
 // host side ---------------------------------------------------------------
 
 bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre) {
-    // [gfx906-opt P3.5] single opt-in source now: on/off is GFX906_HC_UP_PRE
+    // [gfx906-opt P4 default-on] single opt-in source now: on/off is GFX906_HC_UP_PRE
     // (tolerant parser; the legacy GFX906_NO_HC_UP_PRE spelling is retired so there
-    // is exactly one way to disable)
-    static const bool disabled = !hc_env_on("GFX906_HC_UP_PRE");
+    // is exactly one way to disable). gfx906_env_on "=0/off" passes 0; absent = true.
+    static const bool disabled = !hc_env_on("GFX906_HC_UP_PRE", true);
     const ggml_tensor * w  = up->src[0];
     const ggml_tensor * lo = scale->src[0];
     if (disabled || !w->buffer || !ggml_backend_buft_is_cuda_repack(w->buffer->buft) || w->type != GGML_TYPE_Q8_0 ||
