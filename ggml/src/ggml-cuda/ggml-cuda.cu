@@ -3801,6 +3801,7 @@ struct gfx906_hc_dbg {
     long hcpn_candidates = 0;  // hc-post-shaped site where try_hc_post_norm was invoked
     long hcpn_hit        = 0;  // post-norm chain fused
     long hcsma_hit       = 0;  // sma variant with hc fold
+    long hcsma_candidates = 0; // sma-shaped sites whose hc-fold pattern missed
     long scsilu_hit      = 0;  // SCALE->SILU wide-batch fallback
     long emits           = 0;  // hc fusions whose q8_1 emit was actually produced
 };
@@ -3809,16 +3810,19 @@ static void gfx906_hc_dbg_flush() {
     static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
     if (!on) {
         return;
-    }
-    if (g_hc_dbg.hcup_candidates || g_hc_dbg.hcpn_candidates || g_hc_dbg.hcup_hit ||
-        g_hc_dbg.hcpn_hit || g_hc_dbg.hcsma_hit || g_hc_dbg.scsilu_hit || g_hc_dbg.emits) {
+    }    if (g_hc_dbg.hcup_candidates || g_hc_dbg.hcpn_candidates || g_hc_dbg.hcup_hit ||
+        g_hc_dbg.hcpn_hit || g_hc_dbg.hcsma_hit || g_hc_dbg.hcsma_candidates || g_hc_dbg.scsilu_hit || g_hc_dbg.emits) {
         fprintf(stderr,
-                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma=%ld | scsilu=%ld | emits=%ld\n",
+                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma cand=%ld hit=%ld | scsilu=%ld | emits=%ld\n",
                 g_hc_dbg.hcup_candidates, g_hc_dbg.hcup_hit,
                 g_hc_dbg.hcpn_candidates, g_hc_dbg.hcpn_hit,
-                g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits);
+                g_hc_dbg.hcsma_candidates, g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits);
     }
     g_hc_dbg = {};
+}
+static bool g_hc_dbg_enabled() {
+    static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
+    return on;
 }
 
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
