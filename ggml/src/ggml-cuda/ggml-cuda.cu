@@ -3997,6 +3997,7 @@ struct gfx906_hc_dbg {
     long hcpn_candidates = 0;  // hc-post-shaped site where try_hc_post_norm was invoked
     long hcpn_hit        = 0;  // post-norm chain fused
     long hcsma_hit       = 0;  // sma variant with hc fold
+    long hcsma_candidates = 0; // sma-shaped sites whose hc-fold pattern missed
     long scsilu_hit      = 0;  // SCALE->SILU wide-batch fallback
     long emits           = 0;  // hc fusions whose q8_1 emit was actually produced
 };
@@ -4005,16 +4006,19 @@ static void gfx906_hc_dbg_flush() {
     static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
     if (!on) {
         return;
-    }
-    if (g_hc_dbg.hcup_candidates || g_hc_dbg.hcpn_candidates || g_hc_dbg.hcup_hit ||
-        g_hc_dbg.hcpn_hit || g_hc_dbg.hcsma_hit || g_hc_dbg.scsilu_hit || g_hc_dbg.emits) {
+    }    if (g_hc_dbg.hcup_candidates || g_hc_dbg.hcpn_candidates || g_hc_dbg.hcup_hit ||
+        g_hc_dbg.hcpn_hit || g_hc_dbg.hcsma_hit || g_hc_dbg.hcsma_candidates || g_hc_dbg.scsilu_hit || g_hc_dbg.emits) {
         fprintf(stderr,
-                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma=%ld | scsilu=%ld | emits=%ld\n",
+                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma cand=%ld hit=%ld | scsilu=%ld | emits=%ld\n",
                 g_hc_dbg.hcup_candidates, g_hc_dbg.hcup_hit,
                 g_hc_dbg.hcpn_candidates, g_hc_dbg.hcpn_hit,
-                g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits);
+                g_hc_dbg.hcsma_candidates, g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits);
     }
     g_hc_dbg = {};
+}
+static bool g_hc_dbg_enabled() {
+    static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
+    return on;
 }
 
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
@@ -4943,12 +4947,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         const bool ok3 = !ov(a, add) && (b_alias || !ov(b, add)) && !ov(g, add);
                         return ok3;
                     }()) {
-                // [gfx906-opt P3.3] hc_sma variant: the add is the hc block output
-                // (feeds DSV4_HC_POST as x); fold in the inject matvec (runs first, at
-                // i+3 when it is the next node) and the POST chain as one more launch
-                // rides on the post-norm opt-in; GFX906_HC_SMA_OFF=1 splits it back out
-                static const bool no_hcsma = !gfx906_env_on("GFX906_HC_POST_NORM") || gfx906_env_on("GFX906_HC_SMA_OFF");
-                if (!no_hcsma && i + 11 < cgraph->n_nodes) {
+                // [P3.3→e10] rides = REMOVED: hc_sma is now an independent explicit opt-in
+                // (GFX906_HC_SMA=1). When its pattern engages it measured −7.7% tg128 vs
+                // ①+②-only (E10: 36.15 vs 39.03 paired palindrome), so it must not ride
+                // on GFX906_HC_POST_NORM's default-on switch any more.
+                static const bool no_hcsma = !gfx906_env_on("GFX906_HC_SMA") || gfx906_env_on("GFX906_HC_SMA_OFF");
+                if (no_hcsma) {
+                } else if (i + 11 >= cgraph->n_nodes) {
+                    static int hcsma_near_end = 0;
+                    if (g_hc_dbg_enabled() && hcsma_near_end++ < 4)
+                        fprintf(stderr, "[gfx906-hcsma] veto: near graph end i=%d/%d\n", i, cgraph->n_nodes);
+                } else {
                     ggml_tensor * inj = cgraph->nodes[i + 3];
                     if (inj->op == GGML_OP_MUL_MAT && inj->src[0] != add && inj->src[1] != add &&
                             cgraph->nodes[i + 4]->src[0] == inj &&
@@ -4962,6 +4971,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             ++g_hc_dbg.hcsma_hit;
                             return 4 + n_hc;
                         }
+                    } else {
+                        // pattern miss now visible under GFX906_HC_DEBUG (e10 closeout)
+                        static int hcsma_miss_n = 0;
+                        ++g_hc_dbg.hcsma_candidates;
+                        if (g_hc_dbg_enabled() && hcsma_miss_n++ < 8)
+                            fprintf(stderr, "[gfx906-hcsma] veto at i=%d (%s): [i3]=%s@%s [i4]->src0=%s [i7]=%s(src0=%s,%s)\n",
+                                    i, add->name,
+                                    ggml_op_desc(inj), inj->name,
+                                    (cgraph->nodes[i + 4]->src[0] == inj) ? "OK" : cgraph->nodes[i + 4]->name,
+                                    ggml_op_desc(cgraph->nodes[i + 7]),
+                                    cgraph->nodes[i + 7]->src[0]->name, cgraph->nodes[i + 7]->src[0] == add ? "=add" : "!=add");
                     }
                 }
                 ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, (ggml_tensor *) g,
