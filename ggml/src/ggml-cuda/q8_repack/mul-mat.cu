@@ -251,6 +251,45 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     if (ne11 == 1) {
         switch (src0->type) {
             case GGML_TYPE_Q8_0: {
+                // [gfx906-opt P5] shape->mapping ladder for the plain dense c=1 mat-vec.
+                // Default 'g': every probe shape (K>1024) uses the one-wave-per-row mapping
+                // <1,1> (64 threads, grid=ne01) — measured tg128 39.50/39.48 vs legacy
+                // <16,16> (1024 threads, 16 rows/block) 39.08/39.00 = +1.3%, and **bitwise
+                // identical** (greedy 5x3 md5 278be07e == legacy arm; WPR==1 keeps each
+                // row's half-block partition unchanged).
+                // 'w' = legacy <16,16> (A/B arm). 'f' (furnace ladder: rows<512 -> <2,4>)
+                // and 'o' (**always** <2,4>) are DEBUG ONLY: the template's WPR>1 s_part
+                // reduction path was never exercised in production and produces WRONG
+                // values (pplx b1: PPL 111 / NaN; a b8 all3-farm showed 4.2394 which
+                // masked the corruption). Do not use until the WPR>1 schedule is fixed.
+                // GFX906_Q8_SHAPE_DEBUG=1 dumps per-shape dispatch; GFX906_Q8_SHAPE_ROWS
+                // restricts the new mapping to shapes with an equal row count (bisection aid).
+                static const char shape_mode = getenv("GFX906_Q8_SHAPE_MMV") ? getenv("GFX906_Q8_SHAPE_MMV")[0] : 'g';
+                if (getenv("GFX906_Q8_SHAPE_DEBUG")) {
+                    static int dbg_n = 0;
+                    if (dbg_n++ < 40) {
+                        fprintf(stderr, "[q8-shape] %s ne00=%d ne01=%d mode=%c\n", src0->name,
+                            (int) src0->ne[0], (int) ne01, shape_mode);
+                    }
+                }
+                const bool probe = (shape_mode == 'f' || shape_mode == 'o' || shape_mode == 'g') && ne00 > 1024;
+                static const int row_bucket = getenv("GFX906_Q8_SHAPE_ROWS") ? atoi(getenv("GFX906_Q8_SHAPE_ROWS")) : 0;
+                if (probe && (row_bucket == 0 || ne01 == row_bucket)) {
+                    if (shape_mode == 'g' || (shape_mode == 'f' && ne01 >= 512)) {
+                        const dim3 g1(ne01, 1, 1);
+                        mul_mat_vec_q8_0_repacked<1, 1, false><<<g1, 64, 0, stream>>>(
+                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                            nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                            nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                    } else {
+                        const dim3 g4((ne01 + 7) / 8, 1, 1);
+                        mul_mat_vec_q8_0_repacked<2, 4, false><<<g4, 256, 0, stream>>>(
+                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                            nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                            nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                    }
+                    break;
+                }
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 // Measured A/B hook: route Q8_0 through the shared generic
                 // mat-vec. If it holds parity the bespoke kernel retires.
