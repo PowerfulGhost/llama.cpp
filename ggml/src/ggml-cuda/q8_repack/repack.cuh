@@ -127,4 +127,11 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
 
+// [gfx906 E16.3b] Fused MoE down mat-vec + weighted expert reduction (Q5_1, c=1).
+// Returns false when the shape is unsupported (caller falls back to the
+// separate mat-vec + reduction path).
+bool ggml_cuda_mul_mat_id_repacked_down_reduce(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst);
+
 #endif

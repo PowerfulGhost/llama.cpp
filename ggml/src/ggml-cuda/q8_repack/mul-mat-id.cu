@@ -517,7 +517,9 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
         (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
 
-    // [gfx906 E16.3a] q8 emit: the fused GLU kernel also quantizes the down
+    // [gfx906 E16.3b] Fused MoE down mat-vec + weighted expert reduction (c=1).
+// Computes every used expert's down mat-vec for one token with the expert's
+// [gfx906 E16.3a] q8 emit: the fused GLU kernel also quantizes the down
     // projection's input into a repack_xq cache slot, so the standalone
     // quantize_q8_1 launch per glu output disappears (the down node's
     // repack_quantize_src1_q8_1 exact-geometry lookup hits the slot).
@@ -757,3 +759,64 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         w_gate, x_bias, gate_bias, fusion->glu_op);
 }
 
+
+// (scale-) weight folded in and writes the FINAL reduced dst directly.
+bool ggml_cuda_mul_mat_id_repacked_down_reduce(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst) {
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_sub = ne00 >> 5;
+    if (src0->type != GGML_TYPE_Q5_1 || ne00 % 32 != 0 || n_sub > 64 || n_expert_used * n_sub > 256 ||
+            ids->ne[1] != 1 || ids->nb[0] != sizeof(int32_t) ||
+            src1->type != GGML_TYPE_F32 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float) ||
+            (src1->ne[1] != 1 && src1->ne[1] != n_expert_used) ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != ne01 ||
+            weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) || ggml_nelements(weights) != n_expert_used ||
+            (expert_scale != nullptr && (expert_scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(expert_scale) ||
+                ggml_nelements(expert_scale) != n_expert_used))) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+
+    const uint8_t * w;
+    if (src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src)) {
+        w = repack_view_get_cached(src0, src0->view_src, stream);
+    } else {
+        w = (const uint8_t *) src0->data;
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const int64_t x_stride    = ne10_padded / QK8_1;
+    const int64_t n_cols      = src1->ne[1] * src1->ne[2];
+    const int64_t s11         = src1->nb[1] / sizeof(float);
+    ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
+    block_q8_1 * src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne00,
+        ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+        (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+
+    const int32_t * ids_d   = (const int32_t *) ids->data;
+    const float  * wts      = (const float *) weights->data;
+    const float  * scale    = expert_scale != nullptr ? (const float *) expert_scale->data : nullptr;
+    float        * dst_d    = (float *) dst->data;
+    const size_t   expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
+    static const int down_r = getenv("GFX906_DOWN_REDUCE_R") ? atoi(getenv("GFX906_DOWN_REDUCE_R")) : 4;
+    const int64_t n_sub_v = ne00 >> 5;
+    GGML_UNUSED(n_sub_v);
+    auto launch = [&](auto r_c) {
+        constexpr int R = decltype(r_c)::value;
+        const dim3 grid((ne01 + R - 1) / R, 1, 1);
+        mul_mat_vec_repacked_down_reduce<R, GGML_TYPE_Q5_1><<<grid, 256, 0, stream>>>(
+            w, src1_q8_1_d, ids_d, wts, scale, dst_d,
+            (uint32_t) ne00, (uint32_t) ne01, expert_stride, (uint32_t) x_stride, (int) n_expert_used);
+    };
+    switch (down_r) {
+        case 1:  launch(std::integral_constant<int, 1>{}); break;
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        default: launch(std::integral_constant<int, 4>{}); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
