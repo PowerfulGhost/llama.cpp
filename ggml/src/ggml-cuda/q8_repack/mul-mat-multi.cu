@@ -205,7 +205,10 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
     static const bool no_unroll = getenv("GFX906_Q8_MULTI_NO_UNROLL") != nullptr;
     static const bool no_triples = getenv("GFX906_Q8_MULTI_NO_TRIPLES") != nullptr;
     if (no_triples && n == 3) { GGML_ABORT("q8-multi: triple groups disabled but one ran"); }
-    const uint32_t n_half = (uint32_t)(ne00 / 8);    // 2 * ne00/32
+    // n_half = 2 * ne00/32 (16-weight half sub-blocks). The old `ne00/8` here was 2x
+    // oversized (E8 latency note): ITERS picked >=2x the real need — either falling
+    // off the unrolled ladder entirely or inflating register/wasted load work.
+    const uint32_t n_half = (uint32_t)(ne00 / 16);
     const uint32_t iters  = (n_half + 63) / 64;      // half sub-blocks per lane
     if (!no_unroll && iters >= 1 && iters <= 4) {
         switch (iters) {
