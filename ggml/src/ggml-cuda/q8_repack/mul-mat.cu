@@ -258,10 +258,15 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 // identical** (greedy 5x3 md5 278be07e == legacy arm; WPR==1 keeps each
                 // row's half-block partition unchanged).
                 // 'w' = legacy <16,16> (A/B arm). 'f' (furnace ladder: rows<512 -> <2,4>)
-                // and 'o' (**always** <2,4>) are DEBUG ONLY: the template's WPR>1 s_part
-                // reduction path was never exercised in production and produces WRONG
-                // values (pplx b1: PPL 111 / NaN; a b8 all3-farm showed 4.2394 which
-                // masked the corruption). Do not use until the WPR>1 schedule is fixed.
+                //                and 'o' (**always** <2,4>) are usable since the WPR>1 "corruption"
+                // was located: it was never the s_part shared-memory reduction — it was the
+                // dispatch grid. Our template semantics are NOT furnace's: here <ROWS, NWAVES>
+                // covers ROWS rows per block (WPR = NWARPS/ROWS warps K-split per row), while
+                // furnace's <ROWS, NWAVES> covers ROWS*NWAVES rows per block. P5 copied
+                // furnace's grid ((ne01+7)/8 = ROWS*NWAVES=8 rows/block) onto our 2-row/block
+                // template, so only ~(ne01+7)/4 rows were ever written (the rest kept stale
+                // dst values → PPL 111/NaN; per-shape bisection could not fix a row-count bug).
+                // Correct grid for our <2,4> is ceil(ne01/ROWS) = (ne01+1)/2.
                 // GFX906_Q8_SHAPE_DEBUG=1 dumps per-shape dispatch; GFX906_Q8_SHAPE_ROWS
                 // restricts the new mapping to shapes with an equal row count (bisection aid).
                 static const char shape_mode = getenv("GFX906_Q8_SHAPE_MMV") ? getenv("GFX906_Q8_SHAPE_MMV")[0] : 'g';
@@ -282,7 +287,7 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                             nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
                             nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
                     } else {
-                        const dim3 g4((ne01 + 7) / 8, 1, 1);
+                        const dim3 g4((ne01 + 1) / 2, 1, 1); // ROWS=2 rows per block (ours), not furnace's ROWS*NWAVES=8
                         mul_mat_vec_q8_0_repacked<2, 4, false><<<g4, 256, 0, stream>>>(
                             w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                             nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
