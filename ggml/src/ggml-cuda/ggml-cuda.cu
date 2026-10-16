@@ -5256,7 +5256,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             std::vector<q8m_group> q8m_groups;
             std::unordered_map<const ggml_tensor *, q8m_group *> q8m_member_of;
-            const bool repack_glu_fusion = getenv("GGML_CUDA_REPACK_MMV_FUSION") != nullptr;
+            // [T6.1] fused dispatch default now matches ggml_cuda_repack_mmv_fusion_enabled()
+            // (default ON, GFX906_NO_MMV_FUSION=1 / GGML_CUDA_REPACK_MMV_FUSION=0 to disable)
+            const bool repack_glu_fusion = [] {
+                if (getenv("GFX906_NO_MMV_FUSION") != nullptr) {
+                    return false;
+                }
+                const char * e = getenv("GGML_CUDA_REPACK_MMV_FUSION");
+                return e == nullptr || atoi(e) != 0;
+            }();
             if (getenv("GFX906_Q8_MULTI_OFF") == nullptr) {
                 q8m_groups = q8m_build_plan(cgraph, q8m_glu_consumed, repack_glu_fusion);
                 for (auto & g : q8m_groups) {
