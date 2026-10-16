@@ -1356,6 +1356,84 @@ static __global__ void __launch_bounds__(512) mul_mat_vec_repacked_glu_q8(
 #endif
 }
 
+// [gfx906 E16.3b] Fused MoE down mat-vec + weighted expert reduction (Q5_1, c=1):
+// one launch computes all used experts' down matvec for one token and writes the
+// FINAL reduced FFN output (dst_edit) directly — the [M x n_used] intermediate and
+// the standalone moe_weighted_reduction launch disappear. Mapping (furnace
+// mul_mat_vec_q5_1_repacked_down_reduce): 256 threads = n_used experts x n_sub
+// sub-blocks, each thread reads its expert's weights at one sub-block across R
+// rows, partials aprrewait summed through LDS. Inner arithmetic uses rp_traits<WT>
+// exactly like mul_mat_vec_rp<WT,...,true,16> (affine branch incl.), and the w_e
+// scaling rides, so values differ from the two-launch path only by reduction order.
+template <int R, ggml_type WT>
+static __global__ void mul_mat_vec_repacked_down_reduce(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        const int32_t * __restrict__ ids, const float * __restrict__ weights,
+        const float * __restrict__ expert_scale, float * __restrict__ dst,
+        const uint32_t ne0, const uint32_t ne1, const size_t expert_stride,
+        const uint32_t x_stride, const int n_used) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    constexpr int NTHR = 256;
+    __shared__ float red[R][NTHR];
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t e   = tid / n_sub;
+    const uint32_t sb  = tid - e * n_sub;
+    const bool active  = e < (uint32_t) n_used;
+    const uint32_t ea  = active ? e : 0u;
+    const uint32_t sba = active ? sb : 0u;
+    const uint32_t wrow_id = ea;
+    const uint32_t a = wrow_id;   // activation row = assignment = expert slot
+    const uint8_t * w_e_base = wbase + (size_t) ids[a] * expert_stride;
+    const typename rp_traits<WT>::geom wg(ne0, ne1);
+    const block_q8_1 * xb = xq + (size_t) a * x_stride + sba;
+    const float dx = __low2float(xb->ds);
+    const float sx = __high2float(xb->ds);
+    const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+    const float w_e = active ? weights[ea] * (expert_scale != nullptr ? expert_scale[ea] : 1.0f) : 0.0f;
+
+    const uint32_t row0 = blockIdx.x * R;
+    float acc_up[R];
+#pragma unroll
+    for (int g = 0; g < R; ++g) {
+        const uint32_t row = min(row0 + (uint32_t) g, ne1 - 1);
+        uint4 lo, hi;
+        typename rp_traits<WT>::slot_t ds;
+        rp_traits<WT>::load_w(w_e_base, wg, row, sb, lo, hi, ds);
+        int idot = mmvq_dp4a_u4(lo, xq32[0], xq32[1], xq32[2], xq32[3]);
+        idot    += mmvq_dp4a_u4(hi, xq32[4], xq32[5], xq32[6], xq32[7]);
+        float acc_v;
+        if constexpr (rp_traits<WT>::split_scales) {
+            const float2 dd = rp_traits<WT>::scale2(ds);
+            acc_v = dd.x * dx * (float) idot;   // split types: see note — never instantiated for this kernel use
+        } else if constexpr (rp_traits<WT>::affine) {
+            const float2 dd = rp_traits<WT>::scale2(ds);
+            acc_v = dd.x * dx * (float) idot - dd.y * sx;
+        } else {
+            acc_v = rp_traits<WT>::scale(ds) * dx * (float) idot;
+        }
+        acc_up[g] = w_e * acc_v;
+    }
+#pragma unroll
+    for (int g = 0; g < R; ++g) {
+        red[g][tid] = acc_up[g];
+    }
+    __syncthreads();
+    const uint32_t wave = tid >> 6;
+    const uint32_t lane = tid & 63u;
+    for (uint32_t g = wave; g < (uint32_t) R; g += 4) {
+        float acc = red[g][lane] + red[g][lane + 64] + red[g][lane + 128] + red[g][lane + 192];
+        acc = warp_reduce_sum<64>(acc);
+        if (lane == 0 && row0 + g < ne1) {
+            dst[row0 + g] = acc;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, ids, weights, expert_scale, dst, ne0, ne1, expert_stride, x_stride, n_used);
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
 static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,

@@ -3802,6 +3802,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // [gfx906 E16.3b] fused down mat-vec + weighted expert reduction (Q5_1, c=1):
+    // replaces the separate down MUL_MAT_ID launches AND the whole
+    // experts*scale*weight + add-chain with one launch (furnace down_reduce).
+    // opt-in (GFX906_DOWN_REDUCE=1): measured tg128-neutral (see e5 RESULTS) —
+    // non-bitwise path shipped off per the default-on discipline.
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        static const bool down_reduce_on = getenv("GFX906_DOWN_REDUCE") && getenv("GFX906_DOWN_REDUCE")[0] == '1';
+        if (down_reduce_on && i + 1 < cgraph->n_nodes) {
+            ggml_cuda_moe_weighted_reduction_match match;
+            if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node &&
+                    ggml_cuda_repack_mul_mat_should_fire(node->src[0]) && node->src[0]->type == GGML_TYPE_Q5_1) {
+                const int total = match.node_count + 1;
+                const int output_idx = i + match.node_count;
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, total, &output_idx, 1) &&
+                        ggml_cuda_mul_mat_id_repacked_down_reduce(*cuda_ctx, node->src[0], node->src[1],
+                            node->src[2], match.weights, match.expert_scale, match.dst)) {
+                    static std::atomic<bool> witnessed(false);
+                    if (!witnessed.exchange(true)) {
+                        GGML_LOG_WARN("[repack-down-reduce] fused down+reduce engaged\n");
+                    }
+                    return match.node_count;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
