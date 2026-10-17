@@ -1344,7 +1344,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // [gfx906 E17.6] furnace port: cp the *strided view* straight into the cache slot.
+        // Upstream wraps it in ggml_cont, which materialises the 3x10240 window in a scratch
+        // buffer first: an extra strided rect copy + an extra contiguous copy of the same
+        // 120 KB, i.e. two launches and 240 KB of traffic per GDN layer per token
+        // (profile: copyBufferRectAligned 41/tok + copyBuffer(g7680) 36/tok = 0.33 ms/token).
+        // Bitwise identical: both forms write the same element values into dst, no arithmetic.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
