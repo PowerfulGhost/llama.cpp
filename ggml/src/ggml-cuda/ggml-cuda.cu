@@ -4164,31 +4164,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    // [gfx906 A5] adjacent elementwise chain (ADD/SUB/MUL/DIV + softplus/sigmoid/silu): 2-4 nodes,
-    // one shape, single consumer each -> one launch. Kill switch: GGML_CUDA_NO_ELEM_CHAIN_FUSION=1
-    if (node->op == GGML_OP_ADD || node->op == GGML_OP_SUB || node->op == GGML_OP_MUL || node->op == GGML_OP_DIV) {
-        static const bool elem_chain_off = getenv("GGML_CUDA_NO_ELEM_CHAIN_FUSION") != nullptr;
-        ggml_cuda_elem_chain plan;
-        if (!elem_chain_off && ggml_cuda_elem_chain_match(cgraph, i, plan)) {
-            const int out_idx = i + plan.n - 1;
-            enum ggml_op chain_ops[4];
-            for (int k = 0; k < plan.n; ++k) {
-                chain_ops[k] = cgraph->nodes[i + k]->op;
-            }
-            if (ggml_can_fuse_subgraph(cgraph, i, plan.n, chain_ops, &out_idx, 1) &&
-                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, plan.n, &out_idx, 1)) {
-                ggml_cuda_op_elem_chain(*cuda_ctx, plan);
-                static std::atomic<int> elem_chain_n{0};
-                static const bool elem_chain_dbg = getenv("GFX906_ELEM_CHAIN_DEBUG") != nullptr;
-                if (elem_chain_dbg && elem_chain_n.fetch_add(1) < 200) {
-                    GGML_LOG_WARN("[elem-chain] %d nodes ne=[%lld,%lld] -> %s\n", plan.n,
-                            (long long) node->ne[0], (long long) node->ne[1], cgraph->nodes[out_idx]->name);
-                }
-                return plan.n - 1;
-            }
-        }
-    }
-
     // [gfx906 A1] recurrent conv step: GET_ROWS(conv cache) -> CONCAT -> state-tail CPYs (+ SSM_CONV/SILU)
     // in one launch. Matched at the CONCAT so the compute loop can skip the gather.
     if (node->op == GGML_OP_CONCAT) {
