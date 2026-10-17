@@ -53,6 +53,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/qsa-sel.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -781,6 +782,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     }
     return GGML_STATUS_SUCCESS;
 }
+
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
@@ -4163,6 +4165,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [gfx906 A4] QSA selection tail (qwen4exp build_qsa_sel): FILL(ones) -> CUMSUM -> SCALE(dump)
+    // -> SUB -> MUL(live) -> ADD -> CPY(i32), i.e. `sel = (sel - dump)*live + dump` on a [n_sel, n_batch]
+    // cell index. The ramp is the constant n_kv + slot, so one element-wise kernel replaces all seven.
+    if (node->op == GGML_OP_FILL) {
+        const int n = ggml_cuda_try_qsa_sel_fusion(*cuda_ctx, cgraph, i);
+        if (n >= 0) {
+            return n;
+        }
+    }
 
     // [gfx906 A1] recurrent conv step: GET_ROWS(conv cache) -> CONCAT -> state-tail CPYs (+ SSM_CONV/SILU)
     // in one launch. Matched at the CONCAT so the compute loop can skip the gather.
