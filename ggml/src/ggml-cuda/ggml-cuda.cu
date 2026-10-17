@@ -5401,6 +5401,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 (int) (node->src[2] != nullptr) + (int) (node->src[3] != nullptr),
                                 node->src[0] ? " s0=" : "", node->src[0] ? ggml_op_name(node->src[0]->op) : "",
                                 node->name);
+                        if (node->op == GGML_OP_SCALE) {
+                            float sc = 0, bi = 0;
+                            memcpy(&sc, (const float *) node->op_params + 0, sizeof(float));
+                            memcpy(&bi, (const float *) node->op_params + 1, sizeof(float));
+                            const bool inplace = node->src[0] != nullptr && node->src[0]->data == node->data;
+                            GGML_LOG_WARN("[gfx906-graph]      ^ SCALE scale=%g bias=%g inplace=%d src_data=%p dst_data=%p\n",
+                                    (double) sc, (double) bi, (int) inplace,
+                                    node->src[0] ? node->src[0]->data : nullptr, node->data);
+                        }
                         dump_n++;
                     }
                 }
