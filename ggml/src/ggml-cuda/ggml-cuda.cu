@@ -2376,6 +2376,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ADD:
         case GGML_OP_ADD1: // TODO: more efficient implementation
+            // [gfx906 E17.8 dbg] identify the k_bin_bcast dust (180 launches / 0.79 ms per token)
+            static const bool bcast_dbg = getenv("GFX906_BCAST_DEBUG") != nullptr;
+            if (bcast_dbg) {
+                static int bn = 0;
+                if (bn++ < 400) {
+                    GGML_LOG_WARN("[bcast] ADD ne=[%d,%d,%d] src0=%s[%d,%d] src1=%s[%d,%d] name=%s\n",
+                        (int) dst->ne[0], (int) dst->ne[1], (int) dst->ne[2],
+                        ggml_op_name(dst->src[0]->op), (int) dst->src[0]->ne[0], (int) dst->src[0]->ne[1],
+                        ggml_op_name(dst->src[1]->op), (int) dst->src[1]->ne[0], (int) dst->src[1]->ne[1],
+                        dst->name);
+                }
+            }
             ggml_cuda_op_add(ctx, dst);
             break;
         case GGML_OP_ADD_ID:
@@ -2388,6 +2400,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_acc(ctx, dst);
             break;
         case GGML_OP_MUL:
+            static const bool bcast_dbg_m = getenv("GFX906_BCAST_DEBUG") != nullptr;
+            if (bcast_dbg_m) {
+                static int mn = 0;
+                if (mn++ < 400) {
+                    GGML_LOG_WARN("[bcast] MUL ne=[%d,%d,%d] src0=%s[%d,%d] src1=%s[%d,%d] name=%s\n",
+                        (int) dst->ne[0], (int) dst->ne[1], (int) dst->ne[2],
+                        ggml_op_name(dst->src[0]->op), (int) dst->src[0]->ne[0], (int) dst->src[0]->ne[1],
+                        ggml_op_name(dst->src[1]->op), (int) dst->src[1]->ne[0], (int) dst->src[1]->ne[1],
+                        dst->name);
+                }
+            }
             ggml_cuda_op_mul(ctx, dst);
             break;
         case GGML_OP_DIV:
