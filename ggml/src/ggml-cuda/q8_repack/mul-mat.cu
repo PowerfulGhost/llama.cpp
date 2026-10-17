@@ -339,6 +339,29 @@ static __global__ void __launch_bounds__(256) gfx906_q8_seg(
 #endif
 }
 
+static __global__ void gfx906_q8_verify_diff(const float * a, const float * b, int n) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    __shared__ float mx[256];
+    const int t = threadIdx.x;
+    float m = 0.0f, s0 = 0.0f, s1 = 0.0f;
+    for (int i = t; i < n; i += 256) {
+        float d = fabsf(a[i] - b[i]);
+        m = fmaxf(m, d);
+        s0 += a[i]; s1 += b[i];
+    }
+    mx[t] = m;
+#pragma unroll
+    for (int o = 128; o > 0; o >>= 1) mx[t] = fmaxf(mx[t], mx[t ^ o]);
+    if (t == 0) {
+        printf("[splitk-verify] n=%d maxdiff=%.6e sum_a=%.4f sum_b=%.4f rel=%.3e\n",
+               n, (double) mx[0], (double) s0, (double) s1,
+               (double) (fabsf(s0 - s1) / (fabsf(s1) + 1e-30f)));
+    }
+#else
+    GGML_UNUSED_VARS(a, b, n);
+#endif
+}
+
 static __global__ void __launch_bounds__(256) gfx906_q8_splitk(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1) {
@@ -354,7 +377,7 @@ static __global__ void __launch_bounds__(256) gfx906_q8_splitk(
         const uint32_t sb = hb >> 1, half = hb & 1;
         const block_q8_1 * xb = xq + sb;
         const int * xq32  = reinterpret_cast<const int *>(xb->qs) + half * 4;
-        const int * w_int = qs_int + ((size_t) row * (rs >> 2) + sb) * 8 + half * 4;
+        const int * w_int = qs_int + (size_t) row * (rs >> 2) + sb * 8 + half * 4;
         int idot = 0;
 #pragma unroll
         for (int g = 0; g < 4; g++) {
@@ -482,10 +505,65 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                         break;
                     }
                     if (shape_mode == 'x' && ne01 <= 1024 && ne00 >= 4096 && !(x_disable & 4)) {
+                        // [E16.6-debug GFX906_Q8_SPLITK_VERIFY=1] compute splitk into dst, then
+                        // the template <1,1> into a temp, device-compare and print once per shape
+                        static const bool sk_verify = getenv("GFX906_Q8_SPLITK_VERIFY") != nullptr;
+                        if (sk_verify) {
+                            static int sk_v_n = 0;
+                            if (sk_v_n++ < 12) {
+                                gfx906_q8_splitk<<<ne01, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
+                                ggml_cuda_pool_alloc<float> ref(ctx.pool(), ne01);
+                                const dim3 g1(ne01, 1, 1);
+                                mul_mat_vec_q8_0_repacked<1, 1, false><<<g1, 64, 0, stream>>>(
+                                    w, xq, ref.get(), (uint32_t) ne00, (uint32_t) ne01,
+                                    nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                                    nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                                ggml_cuda_pool_alloc<float> rb(ctx.pool(), 2*ne01);
+                                CUDA_CHECK(cudaMemcpyAsync(rb.get(), dst_d, ne01*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                                CUDA_CHECK(cudaMemcpyAsync(rb.get()+ne01, ref.get(), ne01*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                                CUDA_CHECK(cudaStreamSynchronize(stream));
+                                float md = 0.0f; int mb = -1;
+                                float s0 = 0.0f, s1 = 0.0f;
+                                for (int i = 0; i < (int) ne01; i++) {
+                                    float d = fabsf(rb.get()[i] - rb.get()[ne01 + i]);
+                                    if (d > md) { md = d; mb = i; }
+                                    s0 += rb.get()[i]; s1 += rb.get()[ne01 + i];
+                                }
+                                fprintf(stderr, "[splitk-hverify] ne00=%d ne01=%d maxdiff=%.6e at=%d sum_a=%.3f sum_b=%.3f\n",
+                                    (int) ne00, (int) ne01, (double) md, mb, (double) s0, (double) s1);
+                                break;
+                            }
+                        }
                         gfx906_q8_splitk<<<ne01, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
                         break;
                     }
                     if (shape_mode == 'x' && ne01 >= 512 && ne00 % 2048 == 0 && ne00 <= 8192 && !(x_disable & 8)) {
+                        // [E16.6-debug GFX906_Q8_ROWU_VERIFY=1] rowu vs template <1,1>, host-compare
+                        static const bool ru_verify = getenv("GFX906_Q8_ROWU_VERIFY") != nullptr;
+                        static int ru_v_n = 0;
+                        if (ru_verify && ru_v_n++ < 8) {
+                            ggml_cuda_pool_alloc<float> rb(ctx.pool(), 2 * ne01);
+                            switch (ne00 / 1024) {
+                                case 2:  gfx906_q8_rowu<64, 2><<<ne01, 64, 0, stream>>>(w, xq, rb.get(), (uint32_t) ne00, (uint32_t) ne01); break;
+                                case 4:  gfx906_q8_rowu<64, 4><<<ne01, 64, 0, stream>>>(w, xq, rb.get(), (uint32_t) ne00, (uint32_t) ne01); break;
+                                case 6:  gfx906_q8_rowu<64, 6><<<ne01, 64, 0, stream>>>(w, xq, rb.get(), (uint32_t) ne00, (uint32_t) ne01); break;
+                                default: gfx906_q8_rowu<64, 8><<<ne01, 64, 0, stream>>>(w, xq, rb.get(), (uint32_t) ne00, (uint32_t) ne01); break;
+                            }
+                            const dim3 g1r(ne01, 1, 1);
+                            mul_mat_vec_q8_0_repacked<1, 1, false><<<g1r, 64, 0, stream>>>(
+                                w, xq, rb.get() + ne01, (uint32_t) ne00, (uint32_t) ne01,
+                                nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                                nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                            CUDA_CHECK(cudaMemcpyAsync(rb.get() + 2*ne01, rb.get(), 2*ne01*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            float md = 0.0f; int mb = -1;
+                            for (int i = 0; i < (int) ne01; i++) {
+                                float d = fabsf(rb.get()[2*ne01 + i] - rb.get()[3*ne01 + i]);
+                                if (d > md) { md = d; mb = i; }
+                            }
+                            fprintf(stderr, "[rowu-hverify] ne00=%d ne01=%d maxdiff=%.6e at=%d\n", (int) ne00, (int) ne01, (double) md, mb);
+                            break;
+                        }
                         switch (ne00 / 1024) {
                             case 2:  gfx906_q8_rowu<64, 2><<<ne01, 64, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01); break;
                             case 4:  gfx906_q8_rowu<64, 4><<<ne01, 64, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01); break;
