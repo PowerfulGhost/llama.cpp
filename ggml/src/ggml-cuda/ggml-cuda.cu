@@ -3805,10 +3805,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [gfx906 E16.3b] fused down mat-vec + weighted expert reduction (Q5_1, c=1):
     // replaces the separate down MUL_MAT_ID launches AND the whole
     // experts*scale*weight + add-chain with one launch (furnace down_reduce).
-    // opt-in (GFX906_DOWN_REDUCE=1): measured tg128-neutral (see e5 RESULTS) —
-    // non-bitwise path shipped off per the default-on discipline.
+    // DEFAULT-ON since E17.4 (2026-10-17): re-measured on the T10-fixed build with 8 arms
+    // x -r 8 palindrome = +1.38% (43.364 vs 42.775). The earlier "neutral" reading
+    // (E16.3b, -r 4) was inside the noise floor. Kill switch: GFX906_DOWN_REDUCE=0
+    // (tolerant parse — the old `== '1'` test made "=0" a no-op and is a footgun).
     if (node->op == GGML_OP_MUL_MAT_ID) {
-        static const bool down_reduce_on = getenv("GFX906_DOWN_REDUCE") && getenv("GFX906_DOWN_REDUCE")[0] == '1';
+        static const bool down_reduce_on = gfx906_env_on("GFX906_DOWN_REDUCE", true);
         if (down_reduce_on && i + 1 < cgraph->n_nodes) {
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node &&
@@ -4838,6 +4840,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (lo < ehi && elo < hi) e.gen = 0;
                 }
             };
+
+                // [gfx906 E17.4] op-level graph dump for fusion work: one line per node per
+                // graph evaluation (bounded). Prints what actually reaches the dispatcher,
+                // which is the only reliable way to find elementwise fusion opportunities.
+                {
+                    static const bool dump_graph = getenv("GFX906_DUMP_GRAPH") != nullptr;
+                    static int dump_n = 0;
+                    static int dump_gen = 0;
+                    static const ggml_tensor * dump_first = nullptr;
+                    if (dump_graph && dump_first != cgraph->nodes[0]) {
+                        dump_first = cgraph->nodes[0];
+                        GGML_LOG_WARN("[gfx906-graph] ==== eval %d begins (n_nodes=%d) ====\n", dump_gen++, cgraph->n_nodes);
+                    }
+                    if (dump_graph && dump_n < 60000) {
+                        GGML_LOG_WARN("[gfx906-graph] %4d op=%-22s ne=[%5lld,%4lld,%2lld,%2lld] srcs=%d%s%s name=%s\n",
+                                dump_n, ggml_op_name(node->op),
+                                (long long) node->ne[0], (long long) node->ne[1],
+                                (long long) node->ne[2], (long long) node->ne[3],
+                                (int) (node->src[0] != nullptr) + (int) (node->src[1] != nullptr) +
+                                (int) (node->src[2] != nullptr) + (int) (node->src[3] != nullptr),
+                                node->src[0] ? " s0=" : "", node->src[0] ? ggml_op_name(node->src[0]->op) : "",
+                                node->name);
+                        dump_n++;
+                    }
+                }
 
                 // [gfx906-opt P2] before any dispatch: this node will write its output range
                 q8x_invalidate(node);
