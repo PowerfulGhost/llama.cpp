@@ -4,6 +4,7 @@
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+#include "gfx906-f32.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -682,6 +683,16 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+    }
+
+    // [gfx906] F32 GCN mat-vec family (fewrows / rows / grouped) — E17.2: the single-token
+    // decode path is *this* function, not ggml_cuda_mul_mat_f, so the family needs a hook here
+    // too. Only when no fused epilogue (bias / gate / GLU) is attached, and only for F32.
+    if (ids == nullptr && src0->type == GGML_TYPE_F32 &&
+            fusion_local.x_bias == nullptr && fusion_local.gate == nullptr &&
+            fusion_local.gate_bias == nullptr &&
+            ggml_cuda_f32_gcn_matvec(ctx, src0, src1, dst, cc)) {
+        return;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

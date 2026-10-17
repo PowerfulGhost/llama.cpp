@@ -10,9 +10,30 @@
 #include "mmf.cuh"
 #include "../ggml-backend-impl.h"
 
-#if defined(GGML_USE_HIP) && defined(__gfx906__)
+// E17.2 (2026-10-17) BUGFIX: the guard used to be `defined(GGML_USE_HIP) && defined(__gfx906__)`.
+// `__gfx906__` is only defined in the HIP *device* pass, so in the host pass the whole
+// translation unit (kernels + host dispatch) compiled away: gfx906-f32.cu.o was 1.5 KB and
+// ZERO gcn_f32_* kernels ever appeared in a decode profile. That is why T10 measured
+// "neutral" and why the f32m grouping never formed — the port was dead code.
+// Host dispatch + kernel declarations must live in the host pass too (cf. hc-up-pre.cu,
+// which only guards kernel *bodies*). Runtime arch gating is done by GGML_CUDA_CC_IS_GCN(cc).
+#if defined(GGML_USE_HIP)
 #define GCN_F32_ENABLED 1
 #endif
+
+// Tolerant env parsing (cf. hc-up-pre.cu hc_env_on): GFX906_F32 is DEFAULT-ON after
+// E17.2; only an explicit 0/off/false/no disables it. `getenv(...) != nullptr` would
+// make GFX906_F32=0 *enable* it — the exact footgun that bit the P4 hc-up-pre flip.
+static bool gfx906_f32_env_on(const char * name, bool def) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    if (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F') {
+        return false;
+    }
+    return true;
+}
 
 #if GCN_F32_ENABLED
 
@@ -215,18 +236,34 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_multi(const gc
 // Opt-in (default OFF): measures NEUTRAL on this model while changing the
 // summation order relative to MMVF (not bitwise). Kept for future fused HC
 // topologies (dsv4) where the same kernels carry the win on the upstream tree.
+//
+// E17.2 (2026-10-17): the original hook lived only in mmf.cu, which is NOT the
+// path taken by single-token decode (ncols_dst == 1 dispatches to mmvf.cu), so the
+// whole family was dead code there (verified: 0 gcn_f32 kernels in the decode
+// profile with GFX906_F32=1). The hook is now also installed in mmvf.cu.
 bool ggml_cuda_f32_gcn_matvec(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         ggml_tensor * dst, int cc) {
 #if GCN_F32_ENABLED
-    static const bool enabled = getenv("GFX906_F32") != nullptr;
+    static const bool enabled = gfx906_f32_env_on("GFX906_F32", true);
+    GGML_TENSOR_BINARY_OP_LOCALS;
+    // E17.2 diagnosis: dump every F32 mat-vec candidate shape that reaches this hook,
+    // with whether the family fired. Bounded so graph capture stays readable.
+    static const bool dbg = getenv("GFX906_F32_DEBUG") != nullptr;
+    static int dbg_n = 0;
+    if (dbg && dbg_n < 400) {
+        const bool shape_ok = (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
+        GGML_LOG_WARN("[gfx906-f32] cand ne00=%lld ne01=%lld ne11=%lld ne02=%lld nb01=%llu nb0=%llu shape_ok=%d fire=%d\n",
+                      (long long) ne00, (long long) ne01, (long long) ne11, (long long) ne02,
+                      (unsigned long long) nb01, (unsigned long long) nb0, (int) shape_ok, (int) enabled);
+        dbg_n++;
+    }
     if (!enabled) {
         return false;
     }
-    GGML_TENSOR_BINARY_OP_LOCALS;
     constexpr int warp_size = 64;
-    static const bool no_rows  = getenv("GFX906_F32_NO_ROWS") != nullptr;
-    static const bool no_nc    = getenv("GFX906_F32_NO_NC") != nullptr;
+    static const bool no_rows  = !gfx906_f32_env_on("GFX906_F32_ROWS", true);
+    static const bool no_nc    = !gfx906_f32_env_on("GFX906_F32_NC", true);
 
     if (cc == 0 || !GGML_CUDA_CC_IS_GCN(cc) || src0->type != GGML_TYPE_F32 ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -322,10 +359,10 @@ bool ggml_cuda_f32_gcn_matvec(
 
 bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
 #if GCN_F32_ENABLED
-    if (getenv("GFX906_F32") == nullptr) {
+    if (!gfx906_f32_env_on("GFX906_F32", true)) {
         return false;
     }
-    static const bool disabled = getenv("GFX906_F32_NO_MULTI") != nullptr;
+    static const bool disabled = !gfx906_f32_env_on("GFX906_F32_MULTI", true);
     if (disabled || mm->op != GGML_OP_MUL_MAT) {
         return false;
     }
