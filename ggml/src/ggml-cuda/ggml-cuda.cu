@@ -3864,19 +3864,27 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
         return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
     }
     void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, mul);
-    if (ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
-        return 5;
-    }
-    // the q8 emit slot was claimed before the launcher vetoed: never-written q8 in the
-    // ring must not survive (a later consumer whose pool range aliases mul would take a
-    // false cache hit); the per-node invalidation skips its own producer
-    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
-        auto & e = cuda_ctx->repack_xq[k];
-        if (e.gen == cuda_ctx->graph_gen && (e.producer == mul || (mul->data && e.data == mul->data))) {
-            e.gen = 0;
+    if (!ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
+        // the q8 emit slot was claimed before the launcher vetoed: never-written q8 in the
+        // ring must not survive (a later consumer whose pool range aliases mul would take a
+        // false cache hit); the per-node invalidation skips its own producer
+        for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+            auto & e = cuda_ctx->repack_xq[k];
+            if (e.gen == cuda_ctx->graph_gen && (e.producer == mul || (mul->data && e.data == mul->data))) {
+                e.gen = 0;
+            }
         }
+        return 0;
     }
-    return 0;
+    ++g_hc_dbg.emits;
+    // [gfx906-opt P2] the emit only pays off if its entry survives the fused-chain sweep in
+    // the dispatch loop: MUL is evaluated in place over RMS_NORM's output, so the swept
+    // norm node aliases the producer (see ggml_backend_cuda_context::q8_emit_producer)
+    static const bool keep_emit = gfx906_env_on("GFX906_P2_HCPN_EMIT");
+    if (keep_emit && yq != nullptr) {
+        cuda_ctx->q8_emit_producer = mul;
+    }
+    return 5;
 }
 
 // [gfx906-opt P3] byte-range overlap of two tensors' storage
@@ -5029,14 +5037,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 
             // [gfx906-opt P2] invalidate cached q8_1 activations overlapping a
-            // node's write range (producer-safe: never drop own entry).
-            const auto q8x_invalidate = [&](const ggml_tensor * n) {
+            // node's write range (producer-safe: never drop own entry). keep: producer of a
+            // q8_1 emit this very launch wrote, whose entry survives the alias
+            const auto q8x_invalidate = [&](const ggml_tensor * n, const void * keep = nullptr) {
                 if (n == nullptr || n->data == nullptr) return;
                 const char * lo = (const char *) n->data;
                 const char * hi = lo + ggml_nbytes(n);
                 for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
                     auto & e = cuda_ctx->repack_xq[k];
                     if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+                    if (keep != nullptr && e.producer == keep) continue;
                     if (e.producer_nbytes == 0) continue;
                     const char * elo = (const char *) e.producer_data;
                     const char * ehi = elo + e.producer_nbytes;
@@ -5046,6 +5056,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // [gfx906-opt P2] before any dispatch: this node will write its output range
                 q8x_invalidate(node);
+                cuda_ctx->q8_emit_producer = nullptr;
 
                 // gfx906 q8-multi: non-head members are already produced by the head's
                 // one grouped launch; head launches the group here.
@@ -5062,9 +5073,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
-                    // fused chains write multiple outputs: invalidate each
+                    // fused chains write multiple outputs: invalidate each; the q8_1 emit one
+                    // of them wrote (if any) survives its own producer's aliases
+                    const void * q8_keep = cuda_ctx->q8_emit_producer;
+                    cuda_ctx->q8_emit_producer = nullptr;
                     for (int k = 1; k <= nodes_to_skip; ++k) {
-                        q8x_invalidate(cgraph->nodes[i + k]);
+                        q8x_invalidate(cgraph->nodes[i + k], q8_keep);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
