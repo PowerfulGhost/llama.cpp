@@ -4007,7 +4007,7 @@ static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_t
     }
 }
 
-// [gfx906-opt P3.5] tolerant opt-in parser: "0"/"false"/"off" count as OFF, any other
+// [gfx906-opt P3.5] tolerant opt-in parser: "0"/"false"/"off"/"no" count as OFF, any other
 // non-empty value as ON; absent/empty = def. The hc-chain opt-ins were first gated with
 // plain `getenv(X)!=nullptr` (so "VAR=0" wrongly enabled); every gfx906 opt-in reads
 // through this so both meanings are safe (E7 closing notes).
@@ -4016,7 +4016,7 @@ static bool gfx906_env_on(const char * name, bool def = false) {
     if (v == nullptr || *v == '\0') {
         return def;
     }
-    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0);
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 || strcmp(v, "no") == 0);
 }
 
 // [gfx906-opt P3.5] per-eval hc-fusion observability (GFX906_HC_DEBUG=1): hit counters
@@ -4141,9 +4141,12 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
         return 0;
     }
     ++g_hc_dbg.emits;
-    // [gfx906-opt P2] the emit only pays off if its entry survives the fused-chain sweep in
-    // the dispatch loop: MUL is evaluated in place over RMS_NORM's output, so the swept
-    // norm node aliases the producer (see ggml_backend_cuda_context::q8_emit_producer)
+    // [gfx906-opt P2, default off] the emit only pays off if its entry survives the
+    // fused-chain sweep in the dispatch loop: MUL is evaluated in place over RMS_NORM's
+    // output, so the swept norm node aliases the producer (see
+    // ggml_backend_cuda_context::q8_emit_producer). Opt-in GFX906_P2_HCPN_EMIT=1: the
+    // dedicated 4-arm default-vs-opt-out A/B (+0.29%, n=2/side) did not clear 1%
+    // (see experiment-2026-10-18/p2-q8-emit/RESULTS.md §3.1).
     static const bool keep_emit = gfx906_env_on("GFX906_P2_HCPN_EMIT");
     if (keep_emit && yq != nullptr) {
         cuda_ctx->q8_emit_producer = mul;
