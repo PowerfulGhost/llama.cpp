@@ -5204,6 +5204,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // [gfx906 P6.1] producer-epilogue census: exact use counts, one shot per eval
+    if (i == 0) {
+        static const bool pe_census = getenv("GFX906_PE_CENSUS") != nullptr;
+        if (pe_census) {
+            gfx906_pe_census(cgraph);
+        }
+    }
+
     // [gfx906 P6, default ON] adjacent elementwise chain: 2..8 single-use nodes of one
     // shape (ADD/SUB/MUL/DIV/SCALE/CLAMP/SQRT/SQR + unary family) in one launch.
     // tg128 +1.28% mean / +1.92% median over 8 arms/side, bit-identical (greedy md5,

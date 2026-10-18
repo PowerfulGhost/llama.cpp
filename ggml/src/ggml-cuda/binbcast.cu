@@ -1,6 +1,8 @@
 #include "binbcast.cuh"
 #include "convert.cuh"
 #include "unary.cuh"
+#include "q8_repack/repack.cuh"
+#include "../ggml-backend-impl.h"
 #include <cstdint>
 #include <utility>
 
@@ -924,4 +926,102 @@ int gfx906_elem_chain_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * c
         gfx906_elem_chain_launch(ctx, plan);
     }
     return plan.n;
+}
+
+// ===== [gfx906 P6.1] producer-epilogue census (GFX906_PE_CENSUS=1) =====
+// One shot per graph evaluation, exact use counts from the cgraph: which producer
+// nodes have exactly one consumer that could be folded into them (matvec -> SCALE,
+// RMS_NORM -> elementwise, RMS_NORM -> repacked MUL_MAT's activation = q8 emit).
+// This is the "算账 before building" step for the P6.1 epilogues.
+struct gfx906_pe_key {
+    const char * kind;
+    const char * op;
+    const char * type;
+    int64_t      ne0;
+    bool operator==(const gfx906_pe_key & o) const {
+        return strcmp(kind, o.kind) == 0 && strcmp(op, o.op) == 0 && strcmp(type, o.type) == 0 && ne0 == o.ne0;
+    }
+};
+struct gfx906_pe_hash {
+    size_t operator()(const gfx906_pe_key & k) const {
+        size_t h = std::hash<std::string>()(std::string(k.kind) + k.op + k.type);
+        return h ^ (size_t) k.ne0;
+    }
+};
+
+void gfx906_pe_census(const ggml_cgraph * cg) {
+    if (cg == nullptr || cg->n_nodes <= 0) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> idx;
+    idx.reserve(cg->n_nodes);
+    for (int i = 0; i < cg->n_nodes; ++i) {
+        idx[cg->nodes[i]] = i;
+    }
+    std::unordered_map<gfx906_pe_key, int, gfx906_pe_hash> tally;
+    auto bump = [&](const char * kind, const ggml_tensor * c, const char * type, int64_t ne0) {
+        ++tally[gfx906_pe_key{kind, ggml_op_name(c->op), type, ne0}];
+    };
+
+    for (int i = 0; i < cg->n_nodes; ++i) {
+        const ggml_tensor * n = cg->nodes[i];
+        if (ggml_node_get_use_count(cg, i) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        const ggml_tensor * c = nullptr;   // sole consumer
+        int n_cons = 0;
+        for (int j = 0; j < cg->n_nodes && n_cons < 2; ++j) {
+            const ggml_tensor * m = cg->nodes[j];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                // a consumer may read the node through a view/reshape: match on the
+                // underlying storage, not just on the tensor identity
+                const ggml_tensor * src = m->src[s];
+                if (src == nullptr) continue;
+                const bool same = src == n ||
+                    (src->view_src != nullptr && src->data == n->data &&
+                     ggml_nelements(src) == ggml_nelements(n));
+                if (same) {
+                    c = m;
+                    ++n_cons;
+                }
+            }
+        }
+        if (n_cons != 1 || c == nullptr || !(c->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+        const bool c_same_shape = ggml_are_same_shape(c, n);
+        const bool c_reads_n = (c->src[0] != nullptr && c->src[0]->data == n->data) ||
+                               (c->src[1] != nullptr && c->src[1]->data == n->data);
+
+        if (n->op == GGML_OP_MUL_MAT && c->op == GGML_OP_SCALE && c->src[0] == n) {
+            bump("mmv_scale", c, ggml_type_name(n->src[0]->type), n->ne[0]);
+            continue;
+        }
+        if (n->op == GGML_OP_RMS_NORM && c_same_shape && c_reads_n &&
+                (c->op == GGML_OP_SCALE || c->op == GGML_OP_UNARY || c->op == GGML_OP_MUL ||
+                 c->op == GGML_OP_ADD || c->op == GGML_OP_CLAMP)) {
+            bump("norm_elem", c, ggml_type_name(n->type), n->ne[0]);
+            continue;
+        }
+        if (n->op == GGML_OP_RMS_NORM && c->op == GGML_OP_MUL_MAT && c_reads_n &&
+                c->src[0] != nullptr && ggml_cuda_repack_mul_mat_should_fire(c->src[0])) {
+            bump("norm_q8", c, ggml_type_name(c->src[0]->type), n->ne[0]);
+            continue;
+        }
+        if (n->op == GGML_OP_RMS_NORM && c->op == GGML_OP_ROPE) {
+            bump("norm_rope", c, ggml_type_name(n->type), n->ne[0]);
+            continue;
+        }
+    }
+
+    static const bool verbose = getenv("GFX906_PE_CENSUS_VERBOSE") != nullptr;
+    if (!verbose) {
+        static long gen = 0;
+        ++gen;
+    }
+    fprintf(stderr, "[pe-census] n_nodes=%d\n", cg->n_nodes);
+    for (const auto & kv : tally) {
+        fprintf(stderr, "[pe-census]   %-10s -> %-10s type=%-6s ne0=%6lld  count=%d\n",
+                kv.first.kind, kv.first.op, kv.first.type, (long long) kv.first.ne0, kv.second);
+    }
 }

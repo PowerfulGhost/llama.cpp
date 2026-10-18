@@ -58,3 +58,6 @@ struct gfx906_elem_chain_plan {
 
 // dry = match only (stats/launch-free). Returns the number of nodes covered (>=2) or 0.
 int  gfx906_elem_chain_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, bool dry);
+
+// [gfx906 P6.1] one-shot producer-epilogue census, printed per graph evaluation
+void gfx906_pe_census(const ggml_cgraph * cgraph);
