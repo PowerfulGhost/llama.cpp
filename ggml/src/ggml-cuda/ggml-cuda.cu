@@ -4140,6 +4140,14 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
         }
         return 0;
     }
+    ++g_hc_dbg.emits;
+    // [gfx906-opt P2] the emit only pays off if its entry survives the fused-chain sweep in
+    // the dispatch loop: MUL is evaluated in place over RMS_NORM's output, so the swept
+    // norm node aliases the producer (see ggml_backend_cuda_context::q8_emit_producer)
+    static const bool keep_emit = gfx906_env_on("GFX906_P2_HCPN_EMIT");
+    if (keep_emit && yq != nullptr) {
+        cuda_ctx->q8_emit_producer = mul;
+    }
     return 5;
 }
 
@@ -5415,14 +5423,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 
             // [gfx906-opt P2] invalidate cached q8_1 activations overlapping a
-            // node's write range (producer-safe: never drop own entry).
-            const auto q8x_invalidate = [&](const ggml_tensor * n) {
+            // node's write range (producer-safe: never drop own entry). keep: producer of a
+            // q8_1 emit this very launch wrote, whose entry survives the alias
+            const auto q8x_invalidate = [&](const ggml_tensor * n, const void * keep = nullptr) {
                 if (n == nullptr || n->data == nullptr) return;
                 const char * lo = (const char *) n->data;
                 const char * hi = lo + ggml_nbytes(n);
                 for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
                     auto & e = cuda_ctx->repack_xq[k];
                     if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+                    if (keep != nullptr && e.producer == keep) continue;
                     if (e.producer_nbytes == 0) continue;
                     const char * elo = (const char *) e.producer_data;
                     const char * ehi = elo + e.producer_nbytes;
@@ -5466,6 +5476,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // [gfx906-opt P2] before any dispatch: this node will write its output range
                 q8x_invalidate(node);
+                cuda_ctx->q8_emit_producer = nullptr;
 
                 // [gfx906 P2.2] F32 grouped mat-vec
                 if (!f32m_member_of.empty()) {
@@ -5493,9 +5504,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
-                    // fused chains write multiple outputs: invalidate each
+                    // fused chains write multiple outputs: invalidate each; the q8_1 emit one
+                    // of them wrote (if any) survives its own producer's aliases
+                    const void * q8_keep = cuda_ctx->q8_emit_producer;
+                    cuda_ctx->q8_emit_producer = nullptr;
                     for (int k = 1; k <= nodes_to_skip; ++k) {
-                        q8x_invalidate(cgraph->nodes[i + k]);
+                        q8x_invalidate(cgraph->nodes[i + k], q8_keep);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
