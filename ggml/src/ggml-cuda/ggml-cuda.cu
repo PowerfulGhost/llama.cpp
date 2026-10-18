@@ -4393,6 +4393,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // [gfx906 P6, default ON] adjacent elementwise chain: 2..8 single-use nodes of one
+    // shape (ADD/SUB/MUL/DIV/SCALE/CLAMP/SQRT/SQR + unary family) in one launch.
+    // tg128 +1.28% mean / +1.92% median over 8 arms/side, bit-identical (greedy md5,
+    // PPL 4.1982/4.2150 both sides) -- T20, experiment-2026-10-18/p6-elem-chain.
+    // Env: GFX906_ELEM_CHAIN=0/off disables, =dry matches/validates and reports only.
+    // Runs LAST so every pattern above (hc chain, conv step, up/gate GLU, sma,
+    // softcap) keeps its own head node instead of having it swallowed here.
+    {
+        static const int elem_chain_mode = [] {
+            const char * v = getenv("GFX906_ELEM_CHAIN");
+            if (v == nullptr || *v == '\0') {
+                return 1;
+            }
+            if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 || strcmp(v, "no") == 0) {
+                return 0;
+            }
+            return strcmp(v, "dry") == 0 ? 2 : 1;
+        }();
+        if (elem_chain_mode != 0) {
+            const int n_ec = gfx906_elem_chain_try(*cuda_ctx, cgraph, i, elem_chain_mode == 2);
+            if (n_ec >= 2 && elem_chain_mode == 1) {
+                return n_ec - 1;
+            }
+        }
+    }
+
     return 0;
 }
 
