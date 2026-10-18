@@ -5,9 +5,12 @@
 
 #include <cstdlib>
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // Views are never in repacked layout (the scale-plane offset needs the FULL ne1).
@@ -124,24 +127,72 @@ bool ggml_cuda_repack_mmv_id_fusion_supported(const ggml_tensor * src0) {
     return (base || (kquant && kq)) && ggml_cuda_repack_mul_mat_should_fire(src0);
 }
 
+// ---- host parallel repack --------------------------------------------------
+// The repack is a pure byte-layout transform: zero-fill the planes, then write
+// each row into a disjoint slice. Both steps are parallelised when the caller
+// asks for more than one thread; nthreads == 1 keeps the serial path byte for
+// byte identical, so a loader that opts out still produces the same buffers.
+static unsigned repack_host_threads() {
+    static const unsigned n = [] {
+        const char * e = getenv("GFX906_REPACK_THREADS");
+        int v = e != nullptr ? atoi(e) : 0;
+        if (v <= 0) v = 16;
+        unsigned hc = std::thread::hardware_concurrency();
+        if (hc == 0) hc = 1;
+        return std::min<unsigned>((unsigned) v, hc);
+    }();
+    return n;
+}
+
+template <typename Fn>
+static void repack_parallel(int64_t n, int64_t work_bytes, int nthreads, Fn fn) {
+    if (n <= 0) return;
+    const unsigned nt = (unsigned) std::max(1, nthreads);
+    if (nt <= 1 || n < 2 || work_bytes < (int64_t) (1 << 16)) {
+        fn((int64_t) 0, n);
+        return;
+    }
+    const unsigned threads = (unsigned) std::min<int64_t>((int64_t) nt, n);
+    std::vector<std::thread> pool;
+    pool.reserve(threads - 1);
+    for (unsigned t = 1; t < threads; t++) {
+        const int64_t b = n * (int64_t) t / (int64_t) threads;
+        const int64_t e = n * (int64_t) (t + 1) / (int64_t) threads;
+        pool.emplace_back([&fn, b, e] { fn(b, e); });
+    }
+    fn((int64_t) 0, n / (int64_t) threads);
+    for (auto & th : pool) {
+        th.join();
+    }
+}
+
+static void repack_memset(uint8_t * dst, size_t bytes, int nthreads) {
+    repack_parallel((int64_t) bytes, (int64_t) bytes, nthreads, [dst](int64_t b, int64_t e) {
+        std::memset(dst + (size_t) b, 0, (size_t) (e - b));
+    });
+}
+
 // Host repack of one Q8_0 matrix: qs plane [ne1 x nsp x 32] then f16 scale plane
 // [ne1 x nsp]; padding sub-blocks are left zeroed.
-void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads) {
     // a non-multiple ne0 would silently drop the row tail below, so fail loudly instead
     GGML_ASSERT(ne0 % 32 == 0);
     const int64_t n_blocks = ne0 / 32;
     const int64_t qs_str   = repack_qs_stride(ne0);
     const size_t  qs_len   = (size_t) ne1 * qs_str;
+    const size_t  total    = qs_len + (size_t) ne1 * n_blocks * 2;
 
-    memset(dst, 0, qs_len + (size_t) ne1 * n_blocks * 2);
+    repack_memset(dst, total, nthreads);
 
-    for (int64_t row = 0; row < ne1; row++) {
-        for (int64_t blk = 0; blk < n_blocks; blk++) {
-            const block_q8_0 * b = &blocks[row * n_blocks + blk];
-            memcpy(dst + (size_t) row * qs_str + (size_t) blk * 32, b->qs, 32);
-            memcpy(dst + qs_len + (size_t)(row * n_blocks + blk) * 2, &b->d, 2);
+    repack_parallel(ne1, (int64_t) total, nthreads, [=](int64_t row0, int64_t row1) {
+        for (int64_t row = row0; row < row1; row++) {
+            for (int64_t blk = 0; blk < n_blocks; blk++) {
+                const block_q8_0 * b = &blocks[row * n_blocks + blk];
+                memcpy(dst + (size_t) row * qs_str + (size_t) blk * 32, b->qs, 32);
+                memcpy(dst + qs_len + (size_t)(row * n_blocks + blk) * 2, &b->d, 2);
+            }
         }
-    }
+    });
 }
 
 // Host repack of one MXFP4 matrix: nibble rows [ne1 x qs_str, de-aliased like
@@ -245,36 +296,39 @@ void repack_q6k_host(const block_q6_K * blocks, uint8_t * dst, const int64_t ne0
 // Host repack of one Q4_K matrix.
 // Canonical block_q4_K: half d, half dmin, the 12-byte packed scale/min record, then qs[128] where sub-block 2j lives in the low nibbles of bytes 32j..32j+31 and sub-block 2j+1 in their high nibbles.
 // Planes: 16 B packed nibbles per sub-block on the de-aliased row stride (byte i = value i | value (16+i) << 4), the scale record verbatim per super-block, half2 {d, dmin}.
-void repack_q4k_host(const block_q4_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+void repack_q4k_host(const block_q4_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads) {
     GGML_ASSERT(ne0 % 256 == 0);
     const int64_t n_sub  = ne0 / 32;
     const int64_t nsb    = (n_sub + 7) >> 3;
     const int64_t qs_str = repack_qs_row_stride(GGML_TYPE_Q4_K, ne0);
     const size_t  soff   = (size_t) ne1 * qs_str;
     const size_t  doff   = soff + (size_t) ne1 * nsb * 12;
+    const size_t  total  = doff + (size_t) ne1 * nsb * 4;
 
-    memset(dst, 0, doff + (size_t) ne1 * nsb * 4);
+    repack_memset(dst, total, nthreads);
 
-    for (int64_t row = 0; row < ne1; row++) {
-        const block_q4_K * brow = blocks + row * (ne0 / 256);
-        for (int64_t sb = 0; sb < n_sub; sb++) {
-            const block_q4_K * b = &brow[sb >> 3];
-            const int k = (int)(sb & 7);
-            const uint8_t * q = b->qs + 32 * (k >> 1);
-            const int shift = (k & 1) * 4;
-            uint8_t * lows = dst + (size_t) row * qs_str + (size_t) sb * 16;
-            for (int j = 0; j < 16; j++) {
-                const uint8_t v0 = (q[j]      >> shift) & 0xF;
-                const uint8_t v1 = (q[j + 16] >> shift) & 0xF;
-                lows[j] = (uint8_t)(v0 | (v1 << 4));
-            }
-            if (k == 0) {
-                const size_t sbk = (size_t) row * nsb + (sb >> 3);
-                memcpy(dst + soff + sbk * 12, b->scales, 12);
-                memcpy(dst + doff + sbk * 4, b, 4);
+    repack_parallel(ne1, (int64_t) total, nthreads, [=](int64_t row0, int64_t row1) {
+        for (int64_t row = row0; row < row1; row++) {
+            const block_q4_K * brow = blocks + row * (ne0 / 256);
+            for (int64_t sb = 0; sb < n_sub; sb++) {
+                const block_q4_K * b = &brow[sb >> 3];
+                const int k = (int)(sb & 7);
+                const uint8_t * q = b->qs + 32 * (k >> 1);
+                const int shift = (k & 1) * 4;
+                uint8_t * lows = dst + (size_t) row * qs_str + (size_t) sb * 16;
+                for (int j = 0; j < 16; j++) {
+                    const uint8_t v0 = (q[j]      >> shift) & 0xF;
+                    const uint8_t v1 = (q[j + 16] >> shift) & 0xF;
+                    lows[j] = (uint8_t)(v0 | (v1 << 4));
+                }
+                if (k == 0) {
+                    const size_t sbk = (size_t) row * nsb + (sb >> 3);
+                    memcpy(dst + soff + sbk * 12, b->scales, 12);
+                    memcpy(dst + doff + sbk * 4, b, 4);
+                }
             }
         }
-    }
+    });
 }
 
 // Host repack of one Q5_K matrix: Q4_K's planes plus the fifth bit.
@@ -321,31 +375,34 @@ void repack_q5k_host(const block_q5_K * blocks, uint8_t * dst, const int64_t ne0
 }
 
 // Host repack of one Q5_1 matrix: the canonical nibble bytes and fifth-bit word per block are already in plane order, so the three planes are copies.
-void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads) {
     GGML_ASSERT(ne0 % 32 == 0);
     const int64_t n_sub  = ne0 / 32;
     const int64_t qs_str = repack_qs_row_stride(GGML_TYPE_Q5_1, ne0);
     const size_t  hoff   = (size_t) ne1 * qs_str;
     const size_t  doff   = hoff + (size_t) ne1 * n_sub * 4;
+    const size_t  total  = doff + (size_t) ne1 * n_sub * 4;
 
-    memset(dst, 0, doff + (size_t) ne1 * n_sub * 4);
+    repack_memset(dst, total, nthreads);
 
-    for (int64_t row = 0; row < ne1; row++) {
-        const block_q5_1 * brow = blocks + row * n_sub;
-        for (int64_t sb = 0; sb < n_sub; sb++) {
-            const block_q5_1 * b = &brow[sb];
-            const size_t wi = (size_t) row * n_sub + sb;
-            memcpy(dst + (size_t) row * qs_str + (size_t) sb * 16, b->qs, 16);
-            memcpy(dst + hoff + wi * 4, b->qh, 4);
-            memcpy(dst + doff + wi * 4, &b->dm, 4);
+    repack_parallel(ne1, (int64_t) total, nthreads, [=](int64_t row0, int64_t row1) {
+        for (int64_t row = row0; row < row1; row++) {
+            const block_q5_1 * brow = blocks + row * n_sub;
+            for (int64_t sb = 0; sb < n_sub; sb++) {
+                const block_q5_1 * b = &brow[sb];
+                const size_t wi = (size_t) row * n_sub + sb;
+                memcpy(dst + (size_t) row * qs_str + (size_t) sb * 16, b->qs, 16);
+                memcpy(dst + hoff + wi * 4, b->qh, 4);
+                memcpy(dst + doff + wi * 4, &b->dm, 4);
+            }
         }
-    }
+    });
 }
 
-void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads) {
     switch (type) {
         case GGML_TYPE_Q8_0:
-            repack_q8_0_host((const block_q8_0 *) blocks, dst, ne0, ne1);
+            repack_q8_0_host((const block_q8_0 *) blocks, dst, ne0, ne1, nthreads);
             break;
         case GGML_TYPE_MXFP4:
             repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);
@@ -357,16 +414,40 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             repack_q6k_host((const block_q6_K *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_Q4_K:
-            repack_q4k_host((const block_q4_K *) blocks, dst, ne0, ne1);
+            repack_q4k_host((const block_q4_K *) blocks, dst, ne0, ne1, nthreads);
             break;
         case GGML_TYPE_Q5_K:
             repack_q5k_host((const block_q5_K *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_Q5_1:
-            repack_q51_host((const block_q5_1 *) blocks, dst, ne0, ne1);
+            repack_q51_host((const block_q5_1 *) blocks, dst, ne0, ne1, nthreads);
             break;
         default:
             GGML_ABORT("unsupported repack type");
+    }
+}
+
+int ggml_cuda_repack_host_threads() {
+    return (int) repack_host_threads();
+}
+
+// Repack one whole tensor: MoE tensors are split over experts (hundreds of them,
+// so this is the cheapest parallel unit and needs no row split); dense tensors
+// have ne2 == 1 and are split over rows by repack_host itself.
+void repack_host_tensor(ggml_type type, const void * src, uint8_t * dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t src_stride, const size_t dst_stride, const int nthreads) {
+    const uint8_t * s = (const uint8_t *) src;
+    if (ne2 >= 8) {
+        repack_parallel(ne2, (int64_t) dst_stride * ne2, nthreads, [=](int64_t e0, int64_t e1) {
+            for (int64_t e = e0; e < e1; e++) {
+                repack_host(type, s + e * src_stride, dst + e * dst_stride, ne0, ne1, 1);
+            }
+        });
+    } else {
+        for (int64_t e = 0; e < ne2; e++) {
+            repack_host(type, s + e * src_stride, dst + e * dst_stride, ne0, ne1, nthreads);
+        }
     }
 }
 
