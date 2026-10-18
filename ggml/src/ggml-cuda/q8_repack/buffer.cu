@@ -102,10 +102,8 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
     }
     uint8_t * repacked = u.p;
 
-    for (int64_t e = 0; e < ne2; e++) {
-        repack_host(tensor->type, src + e * src_stride,
-            repacked + e * dst_stride, ne0, ne1);
-    }
+    repack_host_tensor(tensor->type, src, repacked, ne0, ne1, ne2,
+        src_stride, dst_stride, ggml_cuda_repack_host_threads());
 
     CUDA_CHECK(cudaMemcpyAsync(tensor->data, repacked, need,
         cudaMemcpyHostToDevice, s_upl_stream[dev]));

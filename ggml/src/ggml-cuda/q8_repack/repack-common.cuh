@@ -602,14 +602,20 @@ template <> struct rp_traits<GGML_TYPE_Q5_1> {
 
 // One entry per supported repack type - generates the dispatch switches.
 #define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q5_1)
-void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_iq4nl_host(const block_iq4_nl * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_q6k_host(const block_q6_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
-void repack_q4k_host(const block_q4_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_q4k_host(const block_q4_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads);
 void repack_q5k_host(const block_q5_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
-void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
-void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads);
+void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1, const int nthreads = 1);
+
+// Parallel host repack entry points used by the -sm layer loader (buffer.cu).
+int  ggml_cuda_repack_host_threads();
+void repack_host_tensor(ggml_type type, const void * src, uint8_t * dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t src_stride, const size_t dst_stride, const int nthreads);
 
 const uint8_t * repack_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base, cudaStream_t stream);
