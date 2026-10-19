@@ -1081,6 +1081,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "LIDX_TOPK_CHUNK",
+    "LIDX_TOPK_MERGE",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1101,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6460,6 +6462,85 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_ldxtk_chunk
+
+struct ggml_tensor * ggml_ldxtk_chunk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        int32_t               n_top,
+        int32_t               chunk_keys) {
+
+    GGML_ASSERT(       q->type == GGML_TYPE_F32);
+    GGML_ASSERT( weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(n_top > 0 && chunk_keys > 0);
+    GGML_ASSERT(      q->ne[0] == k->ne[0]);
+    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(      q->ne[1] == weights->ne[0]);
+    GGML_ASSERT(      k->ne[1] == 1);
+    GGML_ASSERT(   mask->ne[1] == q->ne[2]);
+    GGML_ASSERT(      q->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(   mask->ne[2] == 1);
+    GGML_ASSERT(      q->ne[3] == 1);
+    GGML_ASSERT(      k->ne[3] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(   mask->ne[3] == 1);
+
+    const int64_t n_batch  = q->ne[2];
+    const int64_t n_kv     = k->ne[2];
+    const int64_t n_chunks = (n_kv + chunk_keys - 1) / chunk_keys;
+
+    // the CUDA reduce kernel handles at most 8192 candidates per block, so each
+    // chunk is split into sub-chunks, each producing its own partial table
+    const int64_t n_half   = (chunk_keys + 8191) / 8192;
+
+    // scratch [n_tokens, chunk_keys] + partial [n_chunks*n_half, n_tokens, n_top, 2]
+    const int64_t n_scratch = n_batch * chunk_keys;
+    const int64_t n_partial = n_chunks * n_half * n_batch * n_top * 2;
+
+    int64_t ne[4] = { n_scratch + n_partial, 1, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op   = GGML_OP_LIDX_TOPK_CHUNK;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
+    result->src[3] = mask;
+
+    int32_t params[2] = { n_top, chunk_keys };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    return result;
+}
+
+// ggml_ldxtk_merge
+
+struct ggml_tensor * ggml_ldxtk_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * partial,
+        int32_t               n_top,
+        int32_t               chunk_keys) {
+
+    GGML_ASSERT(partial->op == GGML_OP_LIDX_TOPK_CHUNK);
+    GGML_ASSERT(n_top      == partial->op_params[0]);
+    GGML_ASSERT(chunk_keys == partial->op_params[1]);
+
+    struct ggml_tensor * q      = partial->src[0];
+    const int64_t       n_batch = q->ne[2];
+
+    int64_t ne[4] = { 2, n_top, n_batch, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op   = GGML_OP_LIDX_TOPK_MERGE;
+    result->src[0] = partial;
 
     return result;
 }

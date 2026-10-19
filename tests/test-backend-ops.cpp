@@ -8930,6 +8930,146 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIDX_TOPK_CHUNK + GGML_OP_LIDX_TOPK_MERGE
+struct test_ldxtk : public test_case {
+    const int64_t hsk; // indexer K head size
+    const int64_t nh;  // num indexer heads
+    const int64_t kv;  // pool size
+    const int64_t nb;  // batch size
+    const int32_t n_top;
+    const int32_t chunk;
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hsk, nh, kv, nb, n_top, chunk, type_K);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // The score math differs slightly between the CPU reference and the CUDA
+        // tile kernel (the latter keeps K in f16 in shared memory), so top-k
+        // boundary entries can flip. Selection flips are acceptable when the two
+        // entries' scores are close; anything else counts as a true error.
+        constexpr double FLIP_TOL = 1e-2;
+
+        double num = 0.0, den = 1e-12;
+        double bad = 0.0;
+        size_t n_pairs = 0;
+
+        if (n == (size_t) 2 * n_top * nb) {
+            // MERGE output: [2, n_top, n_tokens] - plane 0 scores, plane 1 indices
+            const size_t half = n / 2;
+            (void) half;
+            for (size_t i = 0; i < half; ++i) {
+                num += (a[i] - b[i]) * (a[i] - b[i]);
+                den += b[i] * b[i];
+                if ((int64_t) a[half + i] != (int64_t) b[half + i]) {
+                    const float sa = a[i];
+                    const float sb = b[i];
+                    if (std::isinf(sa) && std::isinf(sb)) {
+                        continue; // dead-tie: both entries are padding
+                    }
+                    if (std::fabs(sa - sb) / std::max(1.0f, std::fabs(sa)) > FLIP_TOL) {
+                        ++bad; // a true selection disagreement
+                    }
+                }
+            }
+            n_pairs = half;
+        } else if (n > (size_t) nb * chunk + 4) {
+            // CHUNK blob: scratch [nb, chunk] scores + tables [n_tables, nb, n_top, 2]
+            const size_t n_scratch = (size_t) nb * chunk;
+            for (size_t i = 0; i < n_scratch; ++i) {
+                num += (a[i] - b[i]) * (a[i] - b[i]);
+                den += b[i] * b[i];
+            }
+            const size_t base = n_scratch;
+            n_pairs = (n - base) / 2;
+            for (size_t i = 0; i < n_pairs; ++i) {
+                const float sa = a[base + 2 * i];
+                const float sb = b[base + 2 * i];
+                const float xa = a[base + 2 * i + 1];
+                const float xb = b[base + 2 * i + 1];
+                num += (sa - sb) * (sa - sb);
+                den += sb * sb;
+                if (xa != xb) {
+                    if (std::isinf(sa) && std::isinf(sb)) {
+                        continue; // dead-tie
+                    }
+                    if (std::fabs(sa - sb) / std::max(1.0f, std::fabs(sa)) > FLIP_TOL) {
+                        ++bad;
+                    }
+                }
+            }
+        } else {
+            // anything else (sentinels, etc.): plain NMSE
+            num = 0.0;
+            den = 1e-12;
+            for (size_t i = 0; i < n; ++i) {
+                num += (a[i] - b[i]) * (a[i] - b[i]);
+                den += b[i] * b[i];
+            }
+            n_pairs = n;
+        }
+
+        return std::max(num / den, bad / std::max<size_t>(n_pairs, 1));
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ((2 * hsk + 2) * nh + 1) * kv * nb;
+    }
+
+    test_ldxtk(int64_t hsk = 128, int64_t nh = 4, int64_t kv = 10000, int64_t nb = 8, int32_t n_top = 256,
+               int32_t chunk = 4096, ggml_type type_K = GGML_TYPE_F16)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), n_top(n_top), chunk(chunk), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, 1);
+        ggml_set_param(q);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, 1);
+        ggml_set_param(k);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, 1);
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_param(m);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * partial = ggml_ldxtk_chunk(ctx, q, k, w, m, n_top, chunk);
+        ggml_set_name(partial, "partial");
+
+        ggml_tensor * out = ggml_ldxtk_merge(ctx, partial, n_top, chunk);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // a mix of visible (0) and invisible (-inf) cells
+                auto * data = (ggml_fp16_t *) t->data;
+                const int64_t n = ggml_nelements(t);
+                std::mt19937 gen(1234);
+                std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+                for (int64_t i = 0; i < n; ++i) {
+                    data[i] = dist(gen) < 0.2f ? ggml_fp32_to_fp16(-INFINITY) : 0.0f;
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -11964,6 +12104,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    // ldxtk: QSA lightning-indexer score + top-k fusion
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
+        // tail chunk (kv not a multiple of chunk), 20% invisible cells
+        test_cases.emplace_back(new test_ldxtk(128, 4, 10000, 8, 256, 4096, type_K));
+        // a single full chunk
+        test_cases.emplace_back(new test_ldxtk(128, 4, 16384, 8, 512, 16384, type_K));
+        test_cases.emplace_back(new test_ldxtk(128, 4, 16384, 8, 1024, 16384, type_K));
+        // 33 chunk tables -> exercises the merge round
+        test_cases.emplace_back(new test_ldxtk(128, 4, 524352, 8, 512, 16384, type_K));
     }
 
     return test_cases;

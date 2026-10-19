@@ -714,8 +714,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     }
 
     // a ubatch touches at most t_s/kpool + 1 pools per sequence, pad to that bound so the graph keeps its shape
-    // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
-    const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
+    // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max.
+    // kv_size is the per-stream size: a non-unified cache has one stream per sequence (n_stream = n_seq_max),
+    // a unified one a single shared stream - multiplying by n_seq_max there over-reserves 16x at 1M context
+    const uint32_t n_pool_max = kv_size / kpool * idx->get_n_stream();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
 }
