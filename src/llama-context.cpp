@@ -1495,11 +1495,17 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool ub_timing = getenv("LLAMA_UBATCH_TIMING") != nullptr;
+    static const bool ub_timing_sync = getenv("LLAMA_UBATCH_TIMING_SYNC") != nullptr;
+    const int64_t t0 = ub_timing ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    const int64_t t_apply = ub_timing ? ggml_time_us() : 0;
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -1508,7 +1514,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    bool ub_reused = false;
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+        ub_reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1530,6 +1538,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf = model.build_graph(gparams);
 
+        const int64_t t_build = ub_timing ? ggml_time_us() : 0;
+
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
@@ -1545,7 +1555,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+
+        if (ub_timing) {
+            const int64_t t_alloc = ggml_time_us();
+            LLAMA_LOG_WARN("%s: ub_graph_build n_tokens = %u, build = %.1f ms, alloc = %.1f ms\n",
+                    __func__, ubatch.n_tokens, (t_build - t_apply)/1000.0, (t_alloc - t_build)/1000.0);
+        }
     }
+
+    const int64_t t_graph = ub_timing ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1557,7 +1575,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_inputs = ub_timing ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    const int64_t t_compute = ub_timing ? ggml_time_us() : 0;
+    int64_t t_sync = t_compute;
+    if (ub_timing && ub_timing_sync) {
+        ggml_backend_sched_synchronize(sched.get());
+        t_sync = ggml_time_us();
+    }
+    if (ub_timing) {
+        LLAMA_LOG_WARN("%s: ub_timing n_tokens = %u, n_seqs = %u, pp = %d, n_kv = %u, reused = %d, apply = %.1f ms, graph = %.1f ms, inputs = %.1f ms, compute = %.1f ms, wait = %.1f ms\n",
+                __func__, ubatch.n_tokens, ubatch.n_seqs_unq, (int) cparams.pipeline_parallel, 0, (int) ub_reused,
+                (t_apply - t0)/1000.0, (t_graph - t_apply)/1000.0, (t_inputs - t_graph)/1000.0,
+                (t_compute - t_inputs)/1000.0, (t_sync - t_compute)/1000.0);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1967,6 +2000,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     do {
+        static const bool ub_timing_iter = getenv("LLAMA_UBATCH_TIMING") != nullptr;
+        const int64_t t_iter = ub_timing_iter ? ggml_time_us() : 0;
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -2150,6 +2185,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        if (ub_timing_iter) {
+            LLAMA_LOG_WARN("%s: ub_iter total = %.1f ms\n", __func__, (ggml_time_us() - t_iter)/1000.0);
+        }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith

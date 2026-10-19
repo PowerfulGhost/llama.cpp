@@ -818,13 +818,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         const char * env = getenv("GGML_LIDX_TOPK");
         return !env || strcmp(env, "0") != 0;
     }();
-    const bool use_ldxtk = env_ldxtk &&
-                           (int64_t) n_pool * n_tokens >= (1LL << 28) &&
+    static const bool env_ldxtk_force = []() {
+        const char * env = getenv("GGML_LIDX_TOPK");
+        return env && strcmp(env, "2") == 0;
+    }();
+    const bool use_ldxtk = (env_ldxtk_force || (env_ldxtk &&
+                           (int64_t) n_pool * n_tokens >= (1LL << 28))) &&
                            (n_top_pool == 256 || n_top_pool == 512 || n_top_pool == 1024);
 
     ggml_tensor * score     = nullptr;
     ggml_tensor * top_k     = nullptr;
     ggml_tensor * top_score = nullptr;
+    static int qsa_debug = -1;
+    if (qsa_debug < 0) {
+        qsa_debug = getenv("LLAMA_QSA_DEBUG") != NULL;
+    }
+    if (qsa_debug) {
+        LLAMA_LOG_WARN("%s: QSA il = %d, n_pool = %lld, n_tokens = %lld, n_top_pool = %lld, env_ldxtk = %d, use_ldxtk = %d\n",
+                __func__, il, (long long) n_pool, (long long) n_tokens, (long long) n_top_pool,
+                (int) env_ldxtk, (int) use_ldxtk);
+    }
+
     if (use_ldxtk) {
         constexpr int32_t LDXTK_CHUNK = 16384;
         ggml_tensor * partial = ggml_ldxtk_chunk(ctx0, q, pooled, weights, inp_kpool->pool_mask,

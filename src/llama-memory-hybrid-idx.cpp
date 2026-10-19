@@ -369,7 +369,13 @@ namespace {
 
 // The last padded pool is always unused.
 uint32_t kpool_pad(uint32_t n_pool) {
-    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+    // quantization of the pool count: affects the shape of the k-pool graph inputs, so a coarse step keeps
+    // the compute-buffer plan stable for longer (a plan change forces a full-device sync, see P11 16)
+    static const uint32_t step = []() {
+        const char * s = getenv("GGML_KPOOL_PAD");
+        return s ? (uint32_t) std::max(1, atoi(s)) : 64u;
+    }();
+    return std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
 }
 
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
@@ -720,6 +726,16 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_stream();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+
+    static int kpool_debug = -1;
+    if (kpool_debug < 0) {
+        kpool_debug = getenv("GGML_KPOOL_DEBUG") != NULL;
+    }
+    if (kpool_debug) {
+        LLAMA_LOG_WARN("%s: n_tokens = %u, n_pool_real = %u, n_kpool = %u, n_new = %u, n_new_g = %u, n_kv = %u, n_pool_max = %u\n",
+                __func__, ubatch.n_tokens, lay.n_pool_real, kpool_pad(lay.n_pool_real), st.n_new, st.n_new_g,
+                0u, n_pool_max);
+    }
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {

@@ -1766,8 +1766,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
+    static int alloc_timing = -1;
+    if (alloc_timing < 0) {
+        alloc_timing = getenv("GGML_SCHED_ALLOC_TIMING") != NULL;
+    }
+    const int64_t t_a0 = alloc_timing ? ggml_time_us() : 0;
+
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        const int64_t t_a1 = alloc_timing ? ggml_time_us() : 0;
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1789,13 +1796,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
+        const int64_t t_a2 = alloc_timing ? ggml_time_us() : 0;
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
+        const int64_t t_a3 = alloc_timing ? ggml_time_us() : 0;
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
+        }
+        const int64_t t_a4 = alloc_timing ? ggml_time_us() : 0;
+        if (alloc_timing) {
+            GGML_LOG_WARN("%s: alloc_timing first_alloc = %.1f ms, sync = %.1f ms, reserve_n = %.1f ms, alloc2 = %.1f ms, nodes = %d\n",
+                    __func__, (t_a1 - t_a0)/1000.0, (t_a2 - t_a1)/1000.0, (t_a3 - t_a2)/1000.0, (t_a4 - t_a3)/1000.0,
+                    sched->graph.n_nodes);
         }
     }
 
