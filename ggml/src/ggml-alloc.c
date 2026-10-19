@@ -917,29 +917,34 @@ static bool ggml_gallocr_reserve_n_impl(
         for (int i = 0; i < galloc->n_buffers && i < 64; i++) {
             GGML_LOG_WARN("  buf %d: %12.2f MiB\n", i, (double) galloc_top_buf_total[i] / 1048576.0);
         }
-        int galloc_top_sel[32];
-        for (int k = 0; k < 32; k++) galloc_top_sel[k] = -1;
-        for (int k = 0; k < 32; k++) {
-            size_t galloc_top_best = 0;
-            int galloc_top_bi = -1;
-            for (int i = 0; i < graph->n_nodes; i++) {
-                int galloc_top_skip = 0;
-                for (int s = 0; s < k; s++) {
-                    if (galloc_top_sel[s] == i) galloc_top_skip = 1;
+        // top-12 nodes per buffer (nodes only)
+        for (int bi = 0; bi < galloc->n_buffers && bi < 64; bi++) {
+            if (galloc_top_buf_total[bi] == 0) continue;
+            int galloc_top_sel[12];
+            for (int k = 0; k < 12; k++) galloc_top_sel[k] = -1;
+            for (int k = 0; k < 12; k++) {
+                size_t galloc_top_best = 0;
+                int galloc_top_bi2 = -1;
+                for (int i = 0; i < galloc->n_nodes; i++) {
+                    if (galloc->node_allocs[i].dst.buffer_id != bi) continue;
+                    int galloc_top_skip = 0;
+                    for (int s = 0; s < k; s++) {
+                        if (galloc_top_sel[s] == i) galloc_top_skip = 1;
+                    }
+                    if (galloc_top_skip) continue;
+                    size_t sz = ggml_nbytes(graph->nodes[i]);
+                    if (sz > galloc_top_best) {
+                        galloc_top_best = sz;
+                        galloc_top_bi2 = i;
+                    }
                 }
-                if (galloc_top_skip) continue;
-                size_t sz = ggml_nbytes(graph->nodes[i]);
-                if (sz > galloc_top_best) {
-                    galloc_top_best = sz;
-                    galloc_top_bi = i;
-                }
+                if (galloc_top_bi2 < 0 || galloc_top_best == 0) break;
+                galloc_top_sel[k] = galloc_top_bi2;
+                const struct ggml_tensor * t = graph->nodes[galloc_top_bi2];
+                GGML_LOG_WARN("  buf %d top%-2d %-44.44s %10.2f MiB ne=[%ld,%ld,%ld,%ld]\n",
+                        bi, k, t->name, (double) galloc_top_best / 1048576.0,
+                        (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], (long) t->ne[3]);
             }
-            if (galloc_top_bi < 0 || galloc_top_best == 0) break;
-            galloc_top_sel[k] = galloc_top_bi;
-            const struct ggml_tensor * t = graph->nodes[galloc_top_bi];
-            GGML_LOG_WARN("  top%-2d %-48.48s %10.2f MiB ne=[%ld,%ld,%ld,%ld]\n",
-                    k, t->name, (double) galloc_top_best / 1048576.0,
-                    (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], (long) t->ne[3]);
         }
     }
 

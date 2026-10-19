@@ -806,12 +806,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
+
+    // QSA top-k fusion (GGML_LIDX_TOPK, default on): the [n_pool, n_tokens] f32 score
+    // matrix is the largest compute-buffer item at long context (2 GiB/layer at
+    // 16x128k). When it is large, score the pool in chunks and stream a per-chunk
+    // top-k instead; the scores are identical, only the order of exact score ties
+    // can differ.
+    static const bool env_ldxtk = []() {
+        const char * env = getenv("GGML_LIDX_TOPK");
+        return !env || strcmp(env, "0") != 0;
+    }();
+    const bool use_ldxtk = env_ldxtk &&
+                           (int64_t) n_pool * n_tokens >= (1LL << 28) &&
+                           (n_top_pool == 256 || n_top_pool == 512 || n_top_pool == 1024);
+
+    ggml_tensor * score     = nullptr;
+    ggml_tensor * top_k     = nullptr;
+    ggml_tensor * top_score = nullptr;
+    if (use_ldxtk) {
+        constexpr int32_t LDXTK_CHUNK = 16384;
+        ggml_tensor * partial = ggml_ldxtk_chunk(ctx0, q, pooled, weights, inp_kpool->pool_mask,
+                (int32_t) n_top_pool, LDXTK_CHUNK);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, partial, il});
+        cb(partial, "indexer_score", il);
+
+        // top2: [2, n_top_pool, n_tokens], plane 0 = top scores, plane 1 = top pool indices
+        ggml_tensor * top2 = ggml_ldxtk_merge(ctx0, partial, (int32_t) n_top_pool, LDXTK_CHUNK);
+        const size_t plane_bytes = (size_t) n_top_pool * n_tokens * 4;
+        top_k = ggml_reshape_1d(ctx0, ggml_cast(ctx0,
+                ggml_view_2d(ctx0, top2, n_top_pool, n_tokens, (size_t) n_top_pool*4, plane_bytes),
+                GGML_TYPE_I32), n_top_pool*n_tokens);
+        top_score = ggml_reshape_3d(ctx0,
+                ggml_view_2d(ctx0, top2, n_top_pool, n_tokens, (size_t) n_top_pool*4, 0),
+                1, n_top_pool, n_tokens);
+    } else {
+        score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        cb(score, "indexer_score", il);
+        top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
+    }
     cb(top_k, "indexer_top_k", il);
 
     // the top blocks, then the incomplete tail with n_kv for missing cells
@@ -844,7 +879,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
     // some cells from several threads: map every dead slot to its own dump row, idx = dump + live*(idx - dump)
     // a picked pool is live when visible: a visible score is a rectified sum >= 0, an invisible one is -inf
-    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
+    if (!use_ldxtk) {
+        // [1, n_top_pool, n_tokens]
+        top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k);
+    }
     ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
     live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
     // a tail cell is live unless it is the n_kv sentinel

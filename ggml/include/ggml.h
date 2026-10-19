@@ -582,6 +582,8 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_LIDX_TOPK_CHUNK,
+        GGML_OP_LIDX_TOPK_MERGE,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2676,6 +2678,35 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // QSA lightning-indexer score + top-k fusion: avoids materializing the full
+    // [n_pool, n_tokens] f32 score matrix (multi-GiB at long context) by scoring the
+    // pool in chunks of chunk_keys and streaming a per-chunk top-k.
+    // Scores are identical to ggml_lightning_indexer; the selection order of exact
+    // score ties may differ (tie-break: score descending, then lower pool index).
+    //
+    // ggml_ldxtk_chunk: single f32 blob dst, layout:
+    //   scratch [n_tokens, chunk_keys]             chunk score workspace (last chunk after the op)
+    //   partial [n_chunks, n_tokens, n_top, 2]     pairs (score, pool index as f32; -1 = padding)
+    // where n_chunks = ceil(n_pool / chunk_keys); only single stream (all ne[3] == 1).
+    //
+    // ggml_ldxtk_merge: dst = f32 [2, n_top, n_tokens]: plane 0 = top scores, plane 1 = top
+    // pool indices, sorted score-descending, dead padding (-inf, -1) last.
+    //
+    GGML_API struct ggml_tensor * ggml_ldxtk_chunk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        int32_t               n_top,
+        int32_t               chunk_keys);
+
+    GGML_API struct ggml_tensor * ggml_ldxtk_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * partial,
+        int32_t               n_top,
+        int32_t               chunk_keys);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
