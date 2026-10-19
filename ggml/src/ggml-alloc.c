@@ -901,6 +901,48 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // [gfx906-debug] GGML_GALLOC_TOP=1: per-buffer node totals + largest tensors for this reservation
+    if (getenv("GGML_GALLOC_TOP")) {
+        size_t galloc_top_buf_total[64] = {0};
+        for (int i = 0; i < galloc->n_nodes; i++) {
+            int b = galloc->node_allocs[i].dst.buffer_id;
+            if (b >= 0 && b < 64) galloc_top_buf_total[b] += ggml_nbytes(graph->nodes[i]);
+        }
+        for (int i = 0; i < galloc->n_leafs; i++) {
+            int b = galloc->leaf_allocs[i].leaf.buffer_id;
+            if (b >= 0 && b < 64) galloc_top_buf_total[b] += ggml_nbytes(graph->leafs[i]);
+        }
+        GGML_LOG_WARN("%s: GGML_GALLOC_TOP: n_nodes=%d n_leafs=%d, per-buffer node totals:\n",
+                __func__, graph->n_nodes, graph->n_leafs);
+        for (int i = 0; i < galloc->n_buffers && i < 64; i++) {
+            GGML_LOG_WARN("  buf %d: %12.2f MiB\n", i, (double) galloc_top_buf_total[i] / 1048576.0);
+        }
+        int galloc_top_sel[32];
+        for (int k = 0; k < 32; k++) galloc_top_sel[k] = -1;
+        for (int k = 0; k < 32; k++) {
+            size_t galloc_top_best = 0;
+            int galloc_top_bi = -1;
+            for (int i = 0; i < graph->n_nodes; i++) {
+                int galloc_top_skip = 0;
+                for (int s = 0; s < k; s++) {
+                    if (galloc_top_sel[s] == i) galloc_top_skip = 1;
+                }
+                if (galloc_top_skip) continue;
+                size_t sz = ggml_nbytes(graph->nodes[i]);
+                if (sz > galloc_top_best) {
+                    galloc_top_best = sz;
+                    galloc_top_bi = i;
+                }
+            }
+            if (galloc_top_bi < 0 || galloc_top_best == 0) break;
+            galloc_top_sel[k] = galloc_top_bi;
+            const struct ggml_tensor * t = graph->nodes[galloc_top_bi];
+            GGML_LOG_WARN("  top%-2d %-48.48s %10.2f MiB ne=[%ld,%ld,%ld,%ld]\n",
+                    k, t->name, (double) galloc_top_best / 1048576.0,
+                    (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], (long) t->ne[3]);
+        }
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
