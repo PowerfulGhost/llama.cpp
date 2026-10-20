@@ -12611,8 +12611,8 @@ void ggml_compute_forward_ldxtk_merge(
         for (int i = 0; i < n_top; ++i) {
             const float s = i < (int) cands.size() ? cands[i].s : -INFINITY;
             const float x = i < (int) cands.size() ? cands[i].x : -1.0f;
-            dst_d[0*n_top*n_tokens + i*n_tokens + t] = s;
-            dst_d[1*n_top*n_tokens + i*n_tokens + t] = x;
+            dst_d[0*n_top*n_tokens + t*n_top + i] = s;
+            dst_d[1*n_top*n_tokens + t*n_top + i] = x;
         }
     }
 }

@@ -12115,6 +12115,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ldxtk(128, 4, 16384, 8, 1024, 16384, type_K));
         // 33 chunk tables -> exercises the merge round
         test_cases.emplace_back(new test_ldxtk(128, 4, 524352, 8, 512, 16384, type_K));
+        // fewer candidates than the top-k width: the rest of the table must be dead padding
+        // (this is the state of the pool at the start of a long-context prefill)
+        test_cases.emplace_back(new test_ldxtk(128, 4, 100, 4, 256, 4096, type_K));
+        test_cases.emplace_back(new test_ldxtk(128, 4, 300, 4, 512, 4096, type_K));
+        test_cases.emplace_back(new test_ldxtk(128, 4, 1, 4, 256, 4096, type_K));
+        // the tile kernel path (many tokens) with fewer candidates than the width
+        test_cases.emplace_back(new test_ldxtk(128, 4, 100, 512, 256, 4096, type_K));
+        test_cases.emplace_back(new test_ldxtk(128, 4, 300, 512, 512, 4096, type_K));
+        test_cases.emplace_back(new test_ldxtk(128, 4, 10000, 512, 512, 16384, type_K));
     }
 
     return test_cases;

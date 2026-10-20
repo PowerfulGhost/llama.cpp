@@ -964,8 +964,10 @@ static __global__ void __launch_bounds__(256, 1) lidxtk_reduce_kernel(
     for (int i = tl; i < N_TOP; i += 256) {
         const float2 v = sh[i];
         if (MODE == 2) {
-            out[i * n_tokens + t]  = v.x;
-            out1[i * n_tokens + t] = v.y;
+            // the merge output is [2, n_top, n_tokens]: the slot index is the fastest axis,
+            // so that a [n_top, n_tokens] view of the plane reads the slots of one token
+            out[t * N_TOP + i]  = v.x;
+            out1[t * N_TOP + i] = v.y;
         } else {
             ((float2 *) out)[(size_t) t * N_TOP + i] = v;
         }
@@ -1310,8 +1312,10 @@ static __global__ void __launch_bounds__(256, 1) lidxtk_reduce_radix_kernel(
     for (int i = tl; i < N_TOP; i += 256) {
         const float2 v = keep[i];
         if (MODE == 2) {
-            out[i * n_tokens + t]  = v.x;
-            out1[i * n_tokens + t] = v.y;
+            // the merge output is [2, n_top, n_tokens]: the slot index is the fastest axis,
+            // so that a [n_top, n_tokens] view of the plane reads the slots of one token
+            out[t * N_TOP + i]  = v.x;
+            out1[t * N_TOP + i] = v.y;
         } else {
             ((float2 *) out)[(size_t) t * N_TOP + i] = v;
         }
