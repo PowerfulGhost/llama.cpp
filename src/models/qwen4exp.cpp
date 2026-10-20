@@ -696,6 +696,53 @@ public:
     uint32_t n_kv  = 0;
 };
 
+// QSA top-k fusion (GGML_LIDX_TOPK, default on): the [n_pool, n_tokens] f32 score matrix is the
+// largest compute-buffer item at long context (2 GiB per layer at 16x128k), so the pool is scored in
+// chunks and a per-chunk top-k is streamed instead. The scores are identical, only the order of exact
+// score ties can differ.
+//
+// The decision must not depend on the current pool count: the reserve graph walks the full pool while
+// a runtime graph walks the pools of the moment, and a different choice gives the two graphs a
+// different topology, which forces a gallocr re-reserve plus an 8-device sync on every ubatch (P11 16).
+// The worst-case pool count and the ubatch size are the same in both graphs.
+//
+// n_top_sel is the width of the selection: with the fusion it is the worst-case width, so the graph
+// keeps its shape when the pool is still small (the extra slots are dead and get masked out).
+static bool qsa_ldxtk_plan(
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        const llama_cparams &                  cparams,
+        const llama_hparams &                  hparams,
+        int64_t &                              n_top_sel) {
+    static const bool env_ldxtk = []() {
+        const char * env = getenv("GGML_LIDX_TOPK");
+        return !env || strcmp(env, "0") != 0;
+    }();
+    static const bool env_ldxtk_force = []() {
+        const char * env = getenv("GGML_LIDX_TOPK");
+        return env && strcmp(env, "2") == 0;
+    }();
+
+    const int64_t kpool      = hparams.indexer_kpool;
+    const int64_t n_pool_max = mctx_hyb->get_n_pool_max();
+    const int64_t n_ubatch   = std::min<int64_t>(cparams.n_ctx, cparams.n_ubatch);
+    const int64_t n_top_max  = std::min<int64_t>(n_pool_max, hparams.indexer_top_k / kpool);
+
+    n_top_sel = 0;
+
+    if (!env_ldxtk_force && !(env_ldxtk && n_pool_max * n_ubatch >= (1LL << 28))) {
+        return false;
+    }
+
+    // the reduce kernel only has the 256/512/1024 wide instantiations
+    if (n_top_max != 256 && n_top_max != 512 && n_top_max != 1024) {
+        return false;
+    }
+
+    n_top_sel = n_top_max;
+
+    return true;
+}
+
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
     const auto * mctx_idx = mctx_hyb->get_idx();
     GGML_ASSERT(mctx_idx != nullptr);
@@ -723,8 +770,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
-    // the top blocks plus the tail
-    inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    // the top blocks plus the tail: with the fusion the width is the worst-case one, so the shape of the
+    // graph does not change while the pool grows (the slots beyond the pool are dead and get masked out)
+    int64_t n_top_sel = 0;
+    const bool use_ldxtk = qsa_ldxtk_plan(mctx_hyb, cparams, hparams, n_top_sel);
+    inp->n_sel = use_ldxtk ? (int64_t) kpool*n_top_sel + kpool - 1
+                           : (int64_t) kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -807,20 +858,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
 
-    const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+    // QSA top-k fusion (GGML_LIDX_TOPK, default on): see qsa_ldxtk_plan. The decision is taken from the
+    // worst-case pool count and the ubatch size, so the reserve graph and the runtime graphs have the
+    // same topology and the compute-buffer plan stays valid (P11 16).
+    int64_t n_top_sel = 0;
+    const bool use_ldxtk = qsa_ldxtk_plan(mctx_hyb, cparams, hparams, n_top_sel);
 
-    // QSA top-k fusion (GGML_LIDX_TOPK, default on): the [n_pool, n_tokens] f32 score
-    // matrix is the largest compute-buffer item at long context (2 GiB/layer at
-    // 16x128k). When it is large, score the pool in chunks and stream a per-chunk
-    // top-k instead; the scores are identical, only the order of exact score ties
-    // can differ.
-    static const bool env_ldxtk = []() {
-        const char * env = getenv("GGML_LIDX_TOPK");
-        return !env || strcmp(env, "0") != 0;
-    }();
-    const bool use_ldxtk = env_ldxtk &&
-                           (int64_t) n_pool * n_tokens >= (1LL << 28) &&
-                           (n_top_pool == 256 || n_top_pool == 512 || n_top_pool == 1024);
+    // the width of the selection: with the fusion it is the worst-case width (the slots beyond the
+    // current pool are dead), without it the pool is shorter than the top-k
+    const int64_t n_top_pool = use_ldxtk ? n_top_sel : std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
 
     ggml_tensor * score     = nullptr;
     ggml_tensor * top_k     = nullptr;
@@ -835,9 +881,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         // top2: [2, n_top_pool, n_tokens], plane 0 = top scores, plane 1 = top pool indices
         ggml_tensor * top2 = ggml_ldxtk_merge(ctx0, partial, (int32_t) n_top_pool, LDXTK_CHUNK);
         const size_t plane_bytes = (size_t) n_top_pool * n_tokens * 4;
-        top_k = ggml_reshape_1d(ctx0, ggml_cast(ctx0,
+        // the dead slots carry the index -1: clamp it to a valid row, the score plane marks them dead
+        // and the selection mask drops them
+        ggml_tensor * top_idx = ggml_clamp(ctx0,
                 ggml_view_2d(ctx0, top2, n_top_pool, n_tokens, (size_t) n_top_pool*4, plane_bytes),
-                GGML_TYPE_I32), n_top_pool*n_tokens);
+                0.0f, 2147483647.0f);
+        top_k = ggml_reshape_1d(ctx0, ggml_cast(ctx0, top_idx, GGML_TYPE_I32), n_top_pool*n_tokens);
         top_score = ggml_reshape_3d(ctx0,
                 ggml_view_2d(ctx0, top2, n_top_pool, n_tokens, (size_t) n_top_pool*4, 0),
                 1, n_top_pool, n_tokens);
