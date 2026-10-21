@@ -3779,18 +3779,6 @@ static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_t
     }
 }
 
-// [gfx906-opt P3.5] tolerant opt-in parser: "0"/"false"/"off"/"no" count as OFF, any other
-// non-empty value as ON; absent/empty = def. The hc-chain opt-ins were first gated with
-// plain `getenv(X)!=nullptr` (so "VAR=0" wrongly enabled); every gfx906 opt-in reads
-// through this so both meanings are safe (E7 closing notes).
-static bool gfx906_env_on(const char * name, bool def = false) {
-    const char * v = getenv(name);
-    if (v == nullptr || *v == '\0') {
-        return def;
-    }
-    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 || strcmp(v, "no") == 0);
-}
-
 // [gfx906-opt P3.5] per-eval hc-fusion observability (GFX906_HC_DEBUG=1): hit counters
 // every hc-chain branch, printed and reset at each graph evaluation, so a "silently not
 // fused" fallback (cparams, shape gates, liveness vetoes) becomes a visible fact instead
