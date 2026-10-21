@@ -1,4 +1,4 @@
-#include "tp-allreduce.cuh"
+#include "gfx906-tp-allreduce.cuh"
 
 #include <type_traits>
 

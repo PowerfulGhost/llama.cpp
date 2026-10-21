@@ -3,7 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
-#include "ggml-cuda/tp-allreduce.cuh"
+#include "ggml-cuda/gfx906-tp-allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -968,7 +968,7 @@ struct ggml_backend_cuda_comm_context {
     using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
 
     // Plan for the custom AR path.  Filled by the prepare step and consumed by
-    // the per-rank launches (see tp-allreduce.cuh).
+    // the per-rank launches (see gfx906-tp-allreduce.cuh).
     ggml_cuda_tp::CustomARPlan ar_plan;
 
     std::vector<ggml_backend_t> backends;
@@ -1267,7 +1267,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     return ret;
 }
 
-// Custom PCIe-friendly AllReduce (see tp-allreduce.cuh, ported from the mxxm
+// Custom PCIe-friendly AllReduce (see gfx906-tp-allreduce.cuh, ported from the mxxm
 // fork).  The chain above still applies to everything this path declines:
 // non-F32 tensors, messages past the size gate, and hardware without
 // peer-write coherence when NCCL/RCCL is available.
