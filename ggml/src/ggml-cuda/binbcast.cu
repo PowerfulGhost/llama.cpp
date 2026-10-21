@@ -1,5 +1,6 @@
 #include "binbcast.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
 #include <cstdint>
 #include <utility>
 
@@ -584,4 +585,343 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             GGML_ASSERT(false);
         } break;
     }
+}
+
+// ===== [gfx906 P6 -> T9] adjacent elementwise chain: 2..8 nodes -> 1 launch =====
+// Why: every elementwise node in this model is one launch of ~4.2 us GPU time no matter
+// how small the tensor is (measured 581 elementwise launches/token, 2.44 ms/token in
+// experiment-2026-10-18/current-trace). Chains of 2..8 single-consumer nodes are already
+// adjacent in graph order, so evaluating the run in one kernel removes n-1 launches.
+//
+// Math: each step applies exactly the expression its solo kernel uses (the same device
+// functions from unary.cuh, the same a+b / a-b / a*b / a/b, scale*x+bias, fminf/fmaxf
+// clamp order). No reduction order changes, so accepted chains are bit-identical.
+//
+// Safety: the caller (gfx906_elem_chain_try) requires every node but the last to have
+// exactly one use inside the run (ggml_can_fuse_subgraph), all nodes share one shape,
+// every operand is F32 row-contiguous with dims {1, ne}, and no live read overlaps the
+// chain output except an exact element-wise in-place alias.
+
+static int gfx906_ec_code(const ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_ADD:   return GFX906_EC_ADD;
+        case GGML_OP_SUB:   return GFX906_EC_SUB;
+        case GGML_OP_MUL:   return GFX906_EC_MUL;
+        case GGML_OP_DIV:   return GFX906_EC_DIV;
+        case GGML_OP_SCALE: return GFX906_EC_SCALE;
+        case GGML_OP_CLAMP: return GFX906_EC_CLAMP;
+        case GGML_OP_SQRT:  return GFX906_EC_SQRT;
+        case GGML_OP_SQR:   return GFX906_EC_SQR;
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(t)) {
+                case GGML_UNARY_OP_ABS:      return GFX906_EC_ABS;
+                case GGML_UNARY_OP_NEG:      return GFX906_EC_NEG;
+                case GGML_UNARY_OP_TANH:     return GFX906_EC_TANH;
+                case GGML_UNARY_OP_SIGMOID:  return GFX906_EC_SIGMOID;
+                case GGML_UNARY_OP_SILU:     return GFX906_EC_SILU;
+                case GGML_UNARY_OP_SOFTPLUS: return GFX906_EC_SOFTPLUS;
+                case GGML_UNARY_OP_EXP:      return GFX906_EC_EXP;
+                case GGML_UNARY_OP_RELU:     return GFX906_EC_RELU;
+                case GGML_UNARY_OP_GELU:     return GFX906_EC_GELU;
+                case GGML_UNARY_OP_GELU_QUICK: return GFX906_EC_GELU_QUICK;
+                case GGML_UNARY_OP_GELU_ERF:   return GFX906_EC_GELU_ERF;
+                default: return -1;
+            }
+        default: return -1;
+    }
+}
+
+// operand read by a step: F32, dims 0/1 either 1 (broadcast) or the chain's, no dims 2/3,
+// and the contiguous dim must really be contiguous when it is not broadcast
+static bool gfx906_ec_read_ok(const ggml_tensor * t, const ggml_tensor * out) {
+    if (t == nullptr || t->data == nullptr || t->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (t->ne[2] != 1 || t->ne[3] != 1) {
+        return false;
+    }
+    if (t->ne[0] != out->ne[0] && t->ne[0] != 1) {
+        return false;
+    }
+    if (t->ne[0] == out->ne[0] && t->nb[0] != sizeof(float)) {
+        return false;
+    }
+    return t->ne[1] == out->ne[1] || t->ne[1] == 1;
+}
+
+static bool gfx906_ec_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data;
+    const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+// a live read may only touch the chain output as an exact element-wise in-place alias
+static bool gfx906_ec_alias_ok(const ggml_tensor * t, const ggml_tensor * dst) {
+    if (t == nullptr || t->data == nullptr || dst->data == nullptr) {
+        return false;
+    }
+    if (!gfx906_ec_overlaps(t, dst)) {
+        return true;
+    }
+    return t->data == dst->data && ggml_are_same_shape(t, dst);
+}
+
+static void gfx906_ec_fill_operand(gfx906_elem_chain_step & st, const ggml_tensor * op) {
+    st.p  = (const float *) op->data;
+    st.s0 = op->ne[0] == 1 ? 0 : 1;
+    st.s1 = op->ne[1] == 1 ? 0 : (int64_t) (op->nb[1] / sizeof(float));
+}
+
+static void gfx906_ec_miss(const ggml_cgraph * cgraph, int i, int reason) {
+    static const char * v = getenv("GFX906_ELEM_CHAIN_MISS");
+    if (v == nullptr || reason == 2) {   // reason 2 = "not an elementwise op": noise
+        return;
+    }
+    static int n = 0;
+    if (n++ >= 240) {
+        return;
+    }
+    const ggml_tensor * h = cgraph->nodes[i];
+    const ggml_tensor * a = h->src[0];
+    const ggml_tensor * b = h->src[1];
+    fprintf(stderr, "[ec-miss] i=%d reason=%d op=%s ne=[%lld,%lld] src0=%s(%s) ne=[%lld,%lld,%lld,%lld] src1=%s(%s) ne=[%lld,%lld,%lld,%lld]\n",
+            i, reason, ggml_op_desc(h), (long long) h->ne[0], (long long) h->ne[1],
+            a ? ggml_op_desc(a) : "-", a ? ggml_type_name(a->type) : "-",
+            a ? (long long) a->ne[0] : 0, a ? (long long) a->ne[1] : 0, a ? (long long) a->ne[2] : 0, a ? (long long) a->ne[3] : 0,
+            b ? ggml_op_desc(b) : "-", b ? ggml_type_name(b->type) : "-",
+            b ? (long long) b->ne[0] : 0, b ? (long long) b->ne[1] : 0, b ? (long long) b->ne[2] : 0, b ? (long long) b->ne[3] : 0);
+}
+
+static bool gfx906_elem_chain_match(const ggml_cgraph * cgraph, int i, gfx906_elem_chain_plan & plan) {
+    plan.n  = 0;
+    plan.in = nullptr;
+    if (i + 1 >= cgraph->n_nodes) {
+        gfx906_ec_miss(cgraph, i, 1);
+        return false;
+    }
+    const ggml_tensor * head = cgraph->nodes[i];
+    if (gfx906_ec_code(head) < 0 || head->type != GGML_TYPE_F32 ||
+            head->ne[2] != 1 || head->ne[3] != 1) {
+        gfx906_ec_miss(cgraph, i, 2);
+        return false;
+    }
+
+    const ggml_tensor * prev = nullptr;
+    for (int k = 0; k < GFX906_EC_MAX_STEPS && i + k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * node = cgraph->nodes[i + k];
+        const int code = gfx906_ec_code(node);
+        if (code < 0 || node->type != GGML_TYPE_F32 || node->ne[2] != 1 || node->ne[3] != 1) {
+            break;
+        }
+        if (!ggml_are_same_shape(node, head)) {
+            if (k == 0) gfx906_ec_miss(cgraph, i, 3);
+            break;
+        }
+
+        gfx906_elem_chain_step st = {};
+        st.op = code;
+
+        if (code <= GFX906_EC_DIV) {          // binary op
+            const ggml_tensor * a = node->src[0];
+            const ggml_tensor * b = node->src[1];
+            if (k == 0) {
+                // head: the stream is src[0] (that is exactly the solo op's operand order,
+                // including SUB/DIV) and src[1] is the broadcast/paired operand
+                const ggml_tensor * in = a;
+                const ggml_tensor * op = b;
+                if (!gfx906_ec_read_ok(in, head)) {
+                    if (k == 0) gfx906_ec_miss(cgraph, i, 4);
+                    break;
+                }
+                plan.in = in;
+                if (op != nullptr) {
+                    if (!gfx906_ec_read_ok(op, head)) {
+                        if (k == 0) gfx906_ec_miss(cgraph, i, 6);
+                        break;
+                    }
+                    gfx906_ec_fill_operand(st, op);
+                }
+            } else {
+                const ggml_tensor * op = nullptr;
+                if (a == prev) {
+                    op = b;
+                } else if (b == prev && (code == GFX906_EC_ADD || code == GFX906_EC_MUL)) {
+                    op = a;
+                } else {
+                    if (k == 0) gfx906_ec_miss(cgraph, i, 5);
+                    break;
+                }
+                if (op != nullptr) {
+                    if (!gfx906_ec_read_ok(op, head)) {
+                        break;
+                    }
+                    gfx906_ec_fill_operand(st, op);
+                }
+            }
+        } else {                              // unary-shaped op: value comes from src[0]
+            const ggml_tensor * x = node->src[0];
+            if (k == 0) {
+                if (!gfx906_ec_read_ok(x, head) || !ggml_are_same_shape(x, head)) {
+                    gfx906_ec_miss(cgraph, i, 7);
+                    break;
+                }
+                plan.in = x;
+            } else if (x != prev) {
+                break;
+            }
+            if (code == GFX906_EC_SCALE) {
+                st.a = ggml_get_op_params_f32(node, 0);
+                memcpy(&st.b, (const float *) node->op_params + 1, sizeof(float));
+            } else if (code == GFX906_EC_CLAMP) {
+                st.a = ggml_get_op_params_f32(node, 0);
+                st.b = ggml_get_op_params_f32(node, 1);
+            }
+        }
+
+        plan.steps[plan.n] = st;
+        plan.nodes[plan.n] = node;
+        ++plan.n;
+        prev = node;
+    }
+
+    return plan.n >= 2;
+}
+
+// every live read must stay out of the chain output's storage (except an exact in-place alias)
+static bool gfx906_elem_chain_live_ok(const gfx906_elem_chain_plan & plan) {
+    const ggml_tensor * dst = plan.nodes[plan.n - 1];
+    if (!gfx906_ec_alias_ok(plan.in, dst)) {
+        return false;
+    }
+    for (int k = 0; k < plan.n; ++k) {
+        if (plan.steps[k].p == nullptr) {
+            continue;
+        }
+        // steps only carry the operand pointer; recover the tensor from the node's srcs
+        const ggml_tensor * node = plan.nodes[k];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = node->src[s];
+            if (src != nullptr && (const float *) src->data == plan.steps[k].p) {
+                if (!gfx906_ec_alias_ok(src, dst)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static __device__ __forceinline__ float gfx906_ec_apply(const int op, const float v, const float x,
+        const float a, const float b) {
+    switch (op) {
+        case GFX906_EC_ADD:      return v + x;
+        case GFX906_EC_SUB:      return v - x;
+        case GFX906_EC_MUL:      return v * x;
+        case GFX906_EC_DIV:      return v / x;
+        case GFX906_EC_SCALE:    return a * v + b;
+        case GFX906_EC_CLAMP:    return fminf(fmaxf(v, a), b);
+        case GFX906_EC_SQRT:     return sqrtf(v);
+        case GFX906_EC_SQR:      return v * v;
+        case GFX906_EC_ABS:      return fabsf(v);
+        case GFX906_EC_NEG:      return -v;
+        case GFX906_EC_TANH:     return tanhf(v);
+        case GFX906_EC_SIGMOID:  return 1.0f / (1.0f + expf(-v));
+        case GFX906_EC_SILU:     return ggml_cuda_op_silu_single(v);
+        case GFX906_EC_SOFTPLUS: return (v > 20.0f) ? v : logf(1.0f + expf(v));
+        case GFX906_EC_EXP:      return expf(v);
+        case GFX906_EC_RELU:     return fmaxf(v, 0.0f);
+        case GFX906_EC_GELU:     return ggml_cuda_op_gelu_single(v);
+        case GFX906_EC_GELU_QUICK: return v * (1.0f / (1.0f + expf(-1.702f * v)));
+        case GFX906_EC_GELU_ERF:   return 0.5f*v*(1.0f + erff(v*0.70710678118654752440084436210484f));
+    }
+    return v;
+}
+
+struct gfx906_elem_chain_args {
+    const float *              in;
+    int64_t                    in_s0, in_s1;
+    float *                    out;
+    int                        ne0, ne1, n;
+    gfx906_elem_chain_step     st[GFX906_EC_MAX_STEPS];
+};
+
+static __global__ void k_gfx906_elem_chain(const gfx906_elem_chain_args args) {
+    const int i0 = blockIdx.x*blockDim.x + threadIdx.x;
+    const int i1 = blockIdx.y;
+    if (i0 >= args.ne0 || i1 >= args.ne1) {
+        return;
+    }
+    float v = args.in[(int64_t) i0*args.in_s0 + (int64_t) i1*args.in_s1];
+    for (int k = 0; k < args.n; ++k) {
+        const gfx906_elem_chain_step & st = args.st[k];
+        const float x = st.p != nullptr ? st.p[(int64_t) i0*st.s0 + (int64_t) i1*st.s1] : 0.0f;
+        v = gfx906_ec_apply(st.op, v, x, st.a, st.b);
+    }
+    args.out[(int64_t) i1*args.ne0 + i0] = v;
+}
+
+static void gfx906_elem_chain_launch(ggml_backend_cuda_context & ctx, const gfx906_elem_chain_plan & plan) {
+    const ggml_tensor * dst = plan.nodes[plan.n - 1];
+
+    gfx906_elem_chain_args args = {};
+    args.in    = (const float *) plan.in->data;
+    args.in_s0 = plan.in->ne[0] == 1 ? 0 : 1;
+    args.in_s1 = plan.in->ne[1] == 1 ? 0 : (int64_t) (plan.in->nb[1] / sizeof(float));
+    args.out   = (float *) dst->data;
+    args.ne0   = (int) dst->ne[0];
+    args.ne1   = (int) dst->ne[1];
+    args.n     = plan.n;
+    for (int k = 0; k < plan.n; ++k) {
+        args.st[k] = plan.steps[k];
+    }
+
+    const int block = 256;
+    const dim3 grid((args.ne0 + block - 1) / block, args.ne1);
+    k_gfx906_elem_chain<<<grid, block, 0, ctx.stream()>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// per-run tally so a silent mismatch (pattern miss, veto) is visible
+static long g_ec_hits = 0, g_ec_nodes = 0, g_ec_chain_hist[GFX906_EC_MAX_STEPS + 1] = {};
+
+int gfx906_elem_chain_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, bool dry) {
+    gfx906_elem_chain_plan plan;
+    if (!gfx906_elem_chain_match(cgraph, i, plan)) {
+        return 0;
+    }
+    enum ggml_op ops[GFX906_EC_MAX_STEPS];
+    for (int k = 0; k < plan.n; ++k) {
+        ops[k] = plan.nodes[k]->op;
+    }
+    const int out_idx = i + plan.n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, plan.n, ops, &out_idx, 1)) {
+        gfx906_ec_miss(cgraph, i, 8);
+        return 0;
+    }
+    if (!gfx906_elem_chain_live_ok(plan)) {
+        gfx906_ec_miss(cgraph, i, 9);
+        return 0;
+    }
+
+    ++g_ec_hits;
+    g_ec_nodes += plan.n;
+    ++g_ec_chain_hist[plan.n];
+    static const bool dbg = getenv("GFX906_ELEM_CHAIN_DEBUG") != nullptr;
+    if (dbg && g_ec_hits <= 400) {
+        fprintf(stderr, "[elem-chain] n=%d ne=[%lld,%lld] op0=%s -> %s (saved %d launches)\n",
+                plan.n, (long long) cgraph->nodes[i]->ne[0], (long long) cgraph->nodes[i]->ne[1],
+                ggml_op_desc(cgraph->nodes[i]), cgraph->nodes[out_idx]->name, plan.n - 1);
+    }
+
+    if (dbg && (g_ec_hits % 256) == 0) {
+        fprintf(stderr, "[elem-chain] cumulative hits=%ld nodes=%ld launches_saved=%ld\n",
+                g_ec_hits, g_ec_nodes, g_ec_nodes - g_ec_hits);
+    }
+
+    if (!dry) {
+        gfx906_elem_chain_launch(ctx, plan);
+    }
+    return plan.n;
 }
