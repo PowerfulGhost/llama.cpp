@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1734,4 +1735,17 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
+}
+
+// [gfx906] tolerant opt-in / opt-out parsing. Never test `getenv(name) != nullptr`:
+// that makes `VAR=0` mean ON (the P4 hc-up-pre and T10 footguns).
+//   `GFX906_<TECH>_OFF=1|on|true|yes` -> off;  `=0|off|false|no` or unset -> on (def=false).
+// Shared infra owned by T1 (see knowledge/_meta/branch-ledger.md §3).
+static inline bool gfx906_env_on(const char * name, bool def = false) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 ||
+             strcmp(v, "no") == 0);
 }

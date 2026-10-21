@@ -116,7 +116,7 @@ static __global__ void __launch_bounds__(64) mul_mat_vec_q8_0_repacked_multi_u(
 }
 
 bool ggml_cuda_repack_multi_ok(const ggml_tensor * mm) {
-    static const bool disabled = getenv("GFX906_Q8_MULTI_OFF") != nullptr;
+    static const bool disabled = gfx906_env_on("GFX906_Q8_MULTI_OFF");
     if (disabled || mm->op != GGML_OP_MUL_MAT) {
         return false;
     }

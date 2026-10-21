@@ -3699,8 +3699,8 @@ struct q8m_group {
     int n;
 };
 
-// GLU-consumed candidates: the T2 fused up/gate+GLU epilogue owns them when
-// GGML_CUDA_REPACK_MMV_FUSION is on; when it is off the canonical path runs
+// GLU-consumed candidates: the fused up/gate+GLU epilogue owns them when the
+// up/gate fusion is on (GFX906_MMV_FUSION_OFF unset); when it is off the canonical path runs
 // three separate launches for (gate, up, GLU), so grouping the two mat-vecs
 // there is still a win. The grouped kernel computes each row exactly like the
 // ungrouped one, so the outputs stay bitwise identical either way.
@@ -3756,19 +3756,6 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
         }
     }
     return plan;
-}
-
-// [migration shim] tolerant opt-in parser. In the legacy linear history this helper is
-// defined by T3's commit e4042f20c; T1's T14 commit (2f1c72a26) already calls it, so the
-// faithful cherry-pick of T1 alone does not compile. Kept verbatim here so the `-raw` arm
-// can be built and measured. T1's cleanup moves it to common.cuh (shared, T1-owned), and
-// T3 then uses that definition instead of its own.
-static bool gfx906_env_on(const char * name, bool def = false) {
-    const char * v = getenv(name);
-    if (v == nullptr || *v == '\0') {
-        return def;
-    }
-    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0);
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4770,16 +4757,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             std::vector<q8m_group> q8m_groups;
             std::unordered_map<const ggml_tensor *, q8m_group *> q8m_member_of;
-            // [T6.1] fused dispatch default now matches ggml_cuda_repack_mmv_fusion_enabled()
-            // (default ON, GFX906_NO_MMV_FUSION=1 / GGML_CUDA_REPACK_MMV_FUSION=0 to disable)
-            const bool repack_glu_fusion = [] {
-                if (getenv("GFX906_NO_MMV_FUSION") != nullptr) {
-                    return false;
-                }
-                const char * e = getenv("GGML_CUDA_REPACK_MMV_FUSION");
-                return e == nullptr || atoi(e) != 0;
-            }();
-            if (getenv("GFX906_Q8_MULTI_OFF") == nullptr) {
+            // default ON; GFX906_MMV_FUSION_OFF=1 disables (tolerant parse)
+            const bool repack_glu_fusion = !gfx906_env_on("GFX906_MMV_FUSION_OFF");
+            if (!gfx906_env_on("GFX906_Q8_MULTI_OFF")) {
                 q8m_groups = q8m_build_plan(cgraph, q8m_glu_consumed, repack_glu_fusion);
                 for (auto & g : q8m_groups) {
                     for (int k = 0; k < g.n; k++) {

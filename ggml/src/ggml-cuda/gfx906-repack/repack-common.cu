@@ -83,20 +83,14 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
 // for every token count instead, so it must not be offered the fusion.
 // The fused up/gate mat-vec folds three launches into one and is worth +2..3% decode, but at
 // width 1 it reduces in a different order than the canonical path: greedy output diverges and
-// batch-1 perplexity moves by ~0.4%. It is therefore opt-in - set GGML_CUDA_REPACK_MMV_FUSION=1
-// to disable it (GFX906_NO_MMV_FUSION=1). Nothing else depends on it: the unfused repack path is unaffected.
+// batch-1 perplexity moves by ~0.4%. Default ON since T6.1; opt out with
+// GFX906_MMV_FUSION_OFF=1 (tolerant). Nothing else depends on it: the unfused repack path is unaffected.
 // [T6.1, 2026-10-16] default flipped to ON: on the post-T12/T13 tree, palindrome tg128
 // ON 40.32/40.58 vs OFF 39.80/39.51 = +2.0~2.7%; PPL b1 4.2292 / b8 4.2394 (b8 bitwise?=value
 // identical to historical reference) all within the ±0.23 error band; greedy 5x3 deterministic
 // (md5 fcbf3e65) with coherent text (witness: "repack-moe-fusion ... engaged").
 static bool ggml_cuda_repack_mmv_fusion_enabled() {
-    static const bool enabled = [] {
-        if (getenv("GFX906_NO_MMV_FUSION") != nullptr) {
-            return false;
-        }
-        const char * e = getenv("GGML_CUDA_REPACK_MMV_FUSION");
-        return e == nullptr || atoi(e) != 0;
-    }();
+    static const bool enabled = !gfx906_env_on("GFX906_MMV_FUSION_OFF");
     return enabled;
 }
 

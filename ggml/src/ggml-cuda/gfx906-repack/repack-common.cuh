@@ -636,7 +636,7 @@ static inline block_q8_1 * repack_quantize_src1_q8_1(
         int64_t ne10, int64_t ne10_padded, int64_t s11, int64_t s12, int64_t s13,
         int64_t nrows, int64_t ne2, int64_t ne3, size_t nblocks,
         ggml_cuda_pool_alloc<block_q8_1> & fallback, cudaStream_t stream) {
-    static const bool disabled = getenv("GFX906_REPACK_NO_XQ_CACHE") != nullptr;
+    static const bool disabled = gfx906_env_on("GFX906_XQ_CACHE_OFF");
 
     auto quantize_into = [&](void * out) {
         quantize_row_q8_1_cuda((const float *) src1->data, nullptr, (block_q8_1 *) out,
