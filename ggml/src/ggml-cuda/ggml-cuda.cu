@@ -4834,31 +4834,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             };
 
-                // [gfx906 E17.4] op-level graph dump for fusion work: one line per node per
-                // graph evaluation (bounded). Prints what actually reaches the dispatcher,
-                // which is the only reliable way to find elementwise fusion opportunities.
-                {
-                    static const bool dump_graph = getenv("GFX906_DUMP_GRAPH") != nullptr;
-                    static int dump_n = 0;
-                    static int dump_gen = 0;
-                    static const ggml_tensor * dump_first = nullptr;
-                    if (dump_graph && dump_first != cgraph->nodes[0]) {
-                        dump_first = cgraph->nodes[0];
-                        GGML_LOG_WARN("[gfx906-graph] ==== eval %d begins (n_nodes=%d) ====\n", dump_gen++, cgraph->n_nodes);
-                    }
-                    if (dump_graph && dump_n < 60000) {
-                        GGML_LOG_WARN("[gfx906-graph] %4d op=%-22s ne=[%5lld,%4lld,%2lld,%2lld] srcs=%d%s%s name=%s\n",
-                                dump_n, ggml_op_name(node->op),
-                                (long long) node->ne[0], (long long) node->ne[1],
-                                (long long) node->ne[2], (long long) node->ne[3],
-                                (int) (node->src[0] != nullptr) + (int) (node->src[1] != nullptr) +
-                                (int) (node->src[2] != nullptr) + (int) (node->src[3] != nullptr),
-                                node->src[0] ? " s0=" : "", node->src[0] ? ggml_op_name(node->src[0]->op) : "",
-                                node->name);
-                        dump_n++;
-                    }
-                }
-
                 // [gfx906-opt P2] before any dispatch: this node will write its output range
                 q8x_invalidate(node);
 
