@@ -3758,6 +3758,19 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
     return plan;
 }
 
+// [migration shim] tolerant opt-in parser. In the legacy linear history this helper is
+// defined by T3's commit e4042f20c; T1's T14 commit (2f1c72a26) already calls it, so the
+// faithful cherry-pick of T1 alone does not compile. Kept verbatim here so the `-raw` arm
+// can be built and measured. T1's cleanup moves it to common.cuh (shared, T1-owned), and
+// T3 then uses that definition instead of its own.
+static bool gfx906_env_on(const char * name, bool def = false) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
