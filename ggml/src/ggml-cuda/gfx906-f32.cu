@@ -14,16 +14,16 @@
 // `__gfx906__` is only defined in the HIP *device* pass, so in the host pass the whole
 // translation unit (kernels + host dispatch) compiled away: gfx906-f32.cu.o was 1.5 KB and
 // ZERO gcn_f32_* kernels ever appeared in a decode profile. That is why T10 measured
-// "neutral" and why the f32m grouping never formed — the port was dead code.
-// Host dispatch + kernel declarations must live in the host pass too (cf. hc-up-pre.cu,
-// which only guards kernel *bodies*). Runtime arch gating is done by GGML_CUDA_CC_IS_GCN(cc).
+// "neutral" and why the f32m grouping never formed - the port was dead code.
+// Host dispatch + kernel declarations must live in the host pass too (cf.
+// gfx906-hc-up-pre.cu, which only guards kernel *bodies*). Runtime arch gating is
+// done by GGML_CUDA_CC_IS_GCN(cc).
 #if defined(GGML_USE_HIP)
 #define GCN_F32_ENABLED 1
 #endif
 
-// Tolerant env parsing (cf. hc-up-pre.cu hc_env_on): GFX906_F32 is DEFAULT-ON after
-// E17.2; only an explicit 0/off/false/no disables it. `getenv(...) != nullptr` would
-// make GFX906_F32=0 *enable* it — the exact footgun that bit the P4 hc-up-pre flip.
+// Tolerant env parsing: GFX906_F32 is DEFAULT-ON; only an explicit 0/off/false/no
+// disables it. `getenv(...) != nullptr` would make GFX906_F32=0 *enable* it.
 static bool gfx906_f32_env_on(const char * name, bool def) {
     const char * v = getenv(name);
     if (v == nullptr || *v == '\0') {
@@ -234,14 +234,9 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_multi(const gc
 
 #endif // GCN_F32_ENABLED
 
-// Opt-in (default OFF): measures NEUTRAL on this model while changing the
-// summation order relative to MMVF (not bitwise). Kept for future fused HC
-// topologies (dsv4) where the same kernels carry the win on the upstream tree.
-//
-// E17.2 (2026-10-17): the original hook lived only in mmf.cu, which is NOT the
-// path taken by single-token decode (ncols_dst == 1 dispatches to mmvf.cu), so the
-// whole family was dead code there (verified: 0 gcn_f32 kernels in the decode
-// profile with GFX906_F32=1). The hook is now also installed in mmvf.cu.
+// F32 mat-vec family entry point: DEFAULT-ON, `GFX906_F32=0` opts out. Not bitwise
+// vs MMVF (different summation order). Needs the hook in mmvf.cu as well as
+// mmf.cu: single-token decode (ncols_dst == 1) never reaches ggml_cuda_mul_mat_f.
 bool ggml_cuda_f32_gcn_matvec(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         ggml_tensor * dst, int cc) {

@@ -685,7 +685,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
-    // [gfx906] F32 GCN mat-vec family (fewrows / rows / grouped) — E17.2: the single-token
+    // [gfx906] F32 GCN mat-vec family (fewrows / rows / grouped) - E17.2: the single-token
     // decode path is *this* function, not ggml_cuda_mul_mat_f, so the family needs a hook here
     // too. Only when no fused epilogue (bias / gate / GLU) is attached, and only for F32.
     if (ids == nullptr && src0->type == GGML_TYPE_F32 &&
