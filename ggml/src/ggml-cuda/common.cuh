@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1448,6 +1449,28 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // [gfx906-opt P2] graph-wide q8_1 activation cache: ring of persistent
+    // cudaMalloc'd quantized-activation copies, reused while gen == graph_gen
+    // and no node has written the backing range. Persistent buffers keep
+    // captured graphs address-stable; outgrown ones are parked until dtor.
+    struct repack_xq_cache_entry {
+        uint64_t     gen      = 0;
+        const void * data     = nullptr;
+        int64_t      ne[4]    = {};
+        size_t       nb[4]    = {};
+        size_t       bytes    = 0;
+        const void * producer = nullptr;
+        const void * producer_data = nullptr;
+        size_t       producer_nbytes = 0;
+        void *       buf      = nullptr;
+        size_t       cap      = 0;
+    };
+    static constexpr size_t REPACK_XQ_CACHE_N = 16;
+    uint64_t graph_gen = 0;
+    repack_xq_cache_entry repack_xq[REPACK_XQ_CACHE_N];
+    size_t repack_xq_next = 0;
+    std::vector<void *> repack_xq_retired;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1716,4 +1739,18 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
+}
+
+// [gfx906] tolerant opt-in / opt-out parsing. Never test `getenv(name) != nullptr`:
+// that makes `VAR=0` mean ON (the historical helper footguns behind T3's HC up-pre
+// gate and T10's topk gate).
+//   `GFX906_<TECH>_OFF=1|on|true|yes` -> off;  `=0|off|false|no` or unset -> on (def=false).
+// Shared infra owned by T1 (see knowledge/_meta/branch-ledger.md §3).
+static inline bool gfx906_env_on(const char * name, bool def = false) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 ||
+             strcmp(v, "no") == 0);
 }

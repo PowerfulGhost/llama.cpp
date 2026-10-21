@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/gfx906-repack/repack.cuh"
 #include "ggml-cuda/gfx906-f32.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -714,6 +715,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
         }
+    }
+    // [gfx906-opt P2] q8_1 activation cache buffers: grow-only, parked on dtor
+    for (size_t k = 0; k < REPACK_XQ_CACHE_N; ++k) {
+        if (repack_xq[k].buf != nullptr) {
+            repack_xq_retired.push_back(repack_xq[k].buf);
+        }
+    }
+    for (void * p : repack_xq_retired) {
+        CUDA_CHECK(cudaFree(p));
     }
 }
 
@@ -1946,6 +1956,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // A repacked weight runs the repacked kernel; never the canonical fused MMV.
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -1969,10 +1984,29 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+// The repack fused MMV epilogue implements SWIGLU, GEGLU and SWIGLU_OAI at its fixed
+// alpha 1.702 / limit 7.0. Anything else keeps its own GLU node.
+static bool ggml_cuda_repack_fusion_glu_ok(const ggml_tensor * glu) {
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+            return true;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    // A repacked weight runs the repacked kernel; never the canonical fused MMV.
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2067,6 +2101,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        ggml_cuda_mul_mat_repacked(ctx, src0, src1, dst);
+        return;
+    }
+
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
@@ -2145,6 +2184,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_cuda_repack_mul_mat_should_fire(src0)) {
+        ggml_cuda_mul_mat_id_repacked(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
@@ -3501,6 +3545,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
 
+    // O7 differential switch: GGML_CUDA_FUSE_SKIP_OPS="MUL_MAT,RMS_NORM,SCALE,..."
+    // A fusion chain is rejected when ANY op named in the pattern (not just the
+    // head) appears in the list, so families can be carved outen one by one.
+    static const bool fuse_skip_active = getenv("GGML_CUDA_FUSE_SKIP_OPS") != nullptr;
+    if (fuse_skip_active) {
+        static const std::vector<std::string> skip_ops = []() {
+            std::vector<std::string> out;
+            const char * env = getenv("GGML_CUDA_FUSE_SKIP_OPS");
+            if (env == nullptr) {
+                return out;
+            }
+            std::string s = env;
+            size_t pos = 0;
+            while (pos <= s.size()) {
+                size_t sep = s.find_first_of(",;", pos);
+                if (sep == std::string::npos) sep = s.size();
+                std::string tok = s.substr(pos, sep - pos);
+                while (!tok.empty() && (tok.front() == ':' || tok.front() == ' ')) tok.erase(tok.begin());
+                while (!tok.empty() && (tok.back() == ':' || tok.back() == ' ')) tok.pop_back();
+                if (!tok.empty()) out.push_back(tok);
+                pos = sep + 1;
+            }
+            return out;
+        }();
+        if ([&]() {
+                for (auto op : ops) {
+                    const char * name = ggml_op_name(op);
+                    for (const auto & s : skip_ops) {
+                        if (s == name) return true;
+                    }
+                }
+                for (auto uop : unary_ops) {
+                    const char * name = ggml_unary_op_name(uop);
+                    if (name != nullptr) {
+                        for (const auto & s : skip_ops) {
+                            if (s == name) return true;
+                        }
+                    }
+                }
+                return false;
+            }()) {
+            return false;
+        }
+    }
+
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
         return std::equal(list1.begin(), list1.end(), list2.begin(), list2.end());
@@ -3759,6 +3848,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// gfx906 q8-multi plan: group dense repacked Q8_0 mat-vecs sharing src1.
+struct q8m_group {
+    const ggml_tensor * head;
+    std::array<const ggml_tensor *, 3> mms;
+    int n;
+};
+
 // gfx906 F32 family: up to three MUL_MAT with F32 weights (K == 2560) sharing src1.
 struct f32m_group {
     const ggml_tensor * head;
@@ -3808,6 +3904,65 @@ static std::vector<f32m_group> f32m_build_plan(const struct ggml_cgraph * cgraph
     return plan;
 }
 
+// GLU-consumed candidates: the fused up/gate+GLU epilogue owns them when the
+// up/gate fusion is on (GFX906_MMV_FUSION_OFF unset); when it is off the canonical path runs
+// three separate launches for (gate, up, GLU), so grouping the two mat-vecs
+// there is still a win. The grouped kernel computes each row exactly like the
+// ungrouped one, so the outputs stay bitwise identical either way.
+static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, const std::vector<int> & glu_consumed,
+        bool glu_fusion_enabled) {
+    std::vector<q8m_group> plan;
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, const ggml_tensor *>>> by_src1;
+    if (getenv("GFX906_Q8_MULTI_DEBUG")) fprintf(stderr, "[q8m-build] n_nodes=%d\n", cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT
+                || (glu_fusion_enabled && glu_consumed[i])
+                || !ggml_cuda_repack_multi_ok(node)) {   // same predicate incl. env off-switch
+            continue;
+        }
+        by_src1[node->src[1]].push_back({i, node});
+    }
+    if (getenv("GFX906_Q8_MULTI_DEBUG")) {
+        size_t qel = 0;
+        for (auto & kv : by_src1) qel += kv.second.size();
+        fprintf(stderr, "[q8m-build] eligible=%zu buckets=%zu\n", qel, by_src1.size());
+    }
+    for (auto & [src1, members0] : by_src1) {
+        if (members0.size() < 2) {
+            continue;
+        }
+        if (getenv("GFX906_Q8_MULTI_DEBUG")) {
+            fprintf(stderr, "[q8m-plan] src1=%p count=%zu :", (void*) src1, members0.size());
+            for (auto & m : members0) fprintf(stderr, " %s@%d(ne0=%d ne1=%d)", m.second->name, m.first, (int)m.second->src[0]->ne[0], (int)m.second->src[0]->ne[1]);
+            fprintf(stderr, "\n");
+        }
+        q8m_group g{};
+        g.head = members0[0].second;
+        const int head_idx = members0[0].first;
+        const int64_t ne00 = members0[0].second->src[0]->ne[0];
+        for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
+            if (k > 0 && members0[k].second->src[0]->ne[0] != ne00) {
+                continue;
+            }
+            // [correctness] only ever group nodes that are adjacent in graph order.
+            // The grouped kernel writes every member at the head's position, which
+            // extends each member output's live range to the head. ggml's planner may
+            // reuse a non-adjacent member's output buffer for a tensor that is live
+            // in between, so early writes there corrupt unrelated state.
+            if (members0[k].first != head_idx + g.n) {
+                break;
+            }
+            g.mms[g.n++] = members0[k].second;
+        }
+        if (g.n >= 2) {
+            plan.push_back(g);
+            if (plan.size() >= GGML_CUDA_MAX_DEVICES * 48) break;
+        }
+    }
+    return plan;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3826,6 +3981,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // gfx906 family: (dbg) dump repacked Q8_0 MUL_MAT candidates under GFX906_Q8_MULTI_DEBUG=1
+    if (node->op == GGML_OP_MUL_MAT) {
+        static int dbg = getenv("GFX906_Q8_MULTI_DEBUG") ? (getenv("GFX906_Q8_MULTI_DEBUG")[0] == '1' ? 1 : 0) : 0;
+        static int dbg_count = 0;
+        if (dbg && dbg_count < 40) {
+            dbg_count++;
+            const ggml_tensor * w0 = node->src[0];
+            fprintf(stderr, "[q8-mulmat] %s: fire=%d wtype=%s wview=%p ne0=%d ne1=%d src1=%p\n",
+                node->name,
+                (int) ggml_cuda_repack_mul_mat_should_fire(w0),
+                ggml_type_name(w0->type), (void *) w0->view_src,
+                (int) w0->ne[0], (int) w0->ne[1], (void *) node->src[1]);
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -3843,6 +4012,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion.shared_dst = shared;
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
             return 5;
+        }
+    }
+
+    // [gfx906 E16.3b] fused down mat-vec + weighted expert reduction (Q5_1, c=1):
+    // replaces the separate down MUL_MAT_ID launches AND the whole
+    // experts*scale*weight + add-chain with one launch (furnace down_reduce).
+    // DEFAULT-ON since E17.4 (2026-10-17): re-measured on the T10-fixed build with 8 arms
+    // x -r 8 palindrome = +1.38% (43.364 vs 42.775). The earlier "neutral" reading
+    // (E16.3b, -r 4) was inside the noise floor. Kill switch: GFX906_DOWN_REDUCE=0
+    // (tolerant parse — the old `== '1'` test made "=0" a no-op and is a footgun).
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        static const bool down_reduce_on = gfx906_env_on("GFX906_DOWN_REDUCE", true);
+        if (down_reduce_on && i + 1 < cgraph->n_nodes) {
+            ggml_cuda_moe_weighted_reduction_match match;
+            if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node &&
+                    ggml_cuda_repack_mul_mat_should_fire(node->src[0]) && node->src[0]->type == GGML_TYPE_Q5_1) {
+                const int total = match.node_count + 1;
+                const int output_idx = i + match.node_count;
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, total, &output_idx, 1) &&
+                        ggml_cuda_mul_mat_id_repacked_down_reduce(*cuda_ctx, node->src[0], node->src[1],
+                            node->src[2], match.weights, match.expert_scale, match.dst)) {
+                    static std::atomic<bool> witnessed(false);
+                    if (!witnessed.exchange(true)) {
+                        GGML_LOG_WARN("[repack-down-reduce] fused down+reduce engaged\n");
+                    }
+                    return match.node_count;
+                }
+            }
         }
     }
 
@@ -4373,6 +4570,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            // Repacked weights: fuse the up/gate dot products in the repacked mat-vec. Both lanes
+            // share the quantized input and, with ids, the same expert lookup; without this the
+            // repacked path runs up, gate and the GLU as three launches where the canonical path
+            // runs one, which is where its decode deficit comes from. This branch is the plain
+            // {MUL_MAT(_ID), MUL_MAT(_ID), GLU} shape - no bias, no scale - which is exactly what
+            // the fused repack kernels implement; everything else keeps the canonical path.
+            const bool repack_fusion_types_ok = ids == nullptr
+                ? ggml_cuda_repack_mmv_fusion_supported(src0) && ggml_cuda_repack_mmv_fusion_supported(gate->src[0])
+                : ggml_cuda_repack_mmv_id_fusion_supported(src0) && ggml_cuda_repack_mmv_id_fusion_supported(gate->src[0]);
+            if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
+                ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
+                repack_fusion_types_ok &&
+                ggml_cuda_repack_fusion_glu_ok(glu) &&
+                ggml_cuda_repack_mmv_fusion_width_ok(ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate   = gate->src[0];
+                fusion_data.glu_op = ggml_get_glu_op(glu);
+
+                if (ids == nullptr) {
+                    ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
+                } else {
+                    // Witness for the fused expert path, once per type per process.
+                    static std::atomic<bool> repack_fusion_witnessed[GGML_TYPE_COUNT];
+                    if (src0->type < GGML_TYPE_COUNT && !repack_fusion_witnessed[src0->type].load(std::memory_order_relaxed)
+                            && !repack_fusion_witnessed[src0->type].exchange(true, std::memory_order_acq_rel)) {
+                        GGML_LOG_WARN("[repack-moe-fusion] type=%s cols=%d fused up/gate mat-vec engaged\n",
+                                      ggml_type_name(src0->type), (int) glu->ne[2]);
+                    }
+                    ggml_cuda_mul_mat_id_vec_repacked_fused(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
@@ -4683,6 +4915,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    cuda_ctx->graph_gen++;   // [gfx906-opt P2] per-eval generation for the q8_1 activation cache
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4779,6 +5012,46 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // gfx906 family: group dense repacked Q8_0 mat-vecs that share the
+            // same F32 activation (same src1). Members' input deps are a subset of
+            // the head's, so the plan is legal to launch whenever the head is
+            // reached, wherever the members sit in the graph. GLU-consumed rows
+            // (the up/gate fused-epilogue chains) are excluded so the existing
+            // fusions keep priority.
+            std::vector<int> q8m_glu_consumed(cgraph->n_nodes, 0);
+            {
+                std::unordered_map<const ggml_tensor *, int> node_idx;
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    node_idx[cgraph->nodes[i]] = i;
+                }
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const ggml_tensor * u = cgraph->nodes[i];
+                    if (u->op != GGML_OP_GLU) {
+                        continue;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC && u->src[s] != nullptr; s++) {
+                        if (u->src[s]->op == GGML_OP_MUL_MAT) {
+                            auto it = node_idx.find(u->src[s]);
+                            if (it != node_idx.end()) {
+                                q8m_glu_consumed[it->second] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            std::vector<q8m_group> q8m_groups;
+            std::unordered_map<const ggml_tensor *, q8m_group *> q8m_member_of;
+            // default ON; GFX906_MMV_FUSION_OFF=1 disables (tolerant parse)
+            const bool repack_glu_fusion = !gfx906_env_on("GFX906_MMV_FUSION_OFF");
+            if (!gfx906_env_on("GFX906_Q8_MULTI_OFF")) {
+                q8m_groups = q8m_build_plan(cgraph, q8m_glu_consumed, repack_glu_fusion);
+                for (auto & g : q8m_groups) {
+                    for (int k = 0; k < g.n; k++) {
+                        q8m_member_of[g.mms[k]] = &g;
+                    }
+                }
+            }
+
             // [gfx906 P2.2] F32 grouped mat-vec (GDN beta+alpha, router+gate)
             std::vector<f32m_group> f32m_groups;
             std::unordered_map<const ggml_tensor *, f32m_group *> f32m_member_of;
@@ -4792,6 +5065,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                q8m_group * q8m_g = nullptr;
+                if (!q8m_member_of.empty()) {
+                    auto it = q8m_member_of.find(node);
+                    if (it != q8m_member_of.end()) {
+                        q8m_g = it->second;
+                    }
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4832,17 +5112,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // [gfx906 P2.2] F32 grouped mat-vec
-                if (!f32m_member_of.empty()) {
-                    auto it = f32m_member_of.find(node);
-                    if (it != f32m_member_of.end()) {
-                        if (node == it->second->head) {
-                            ggml_cuda_mul_mat_f_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(it->second->mms.data()), it->second->n);
-                        }
-                        continue;
-                    }
-                }
-
                 // [gfx906 T6] a conv-state gather read in place by its fused conv step
                 if (node->op == GGML_OP_GET_ROWS && ggml_cuda_conv_state_gather_elidable(cgraph, node)) {
                     continue;
@@ -4856,9 +5125,53 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 cuda_ctx->cur_cgraph = cgraph;
 
+            // [gfx906-opt P2] invalidate cached q8_1 activations overlapping a
+            // node's write range (producer-safe: never drop own entry).
+            const auto q8x_invalidate = [&](const ggml_tensor * n) {
+                if (n == nullptr || n->data == nullptr) return;
+                const char * lo = (const char *) n->data;
+                const char * hi = lo + ggml_nbytes(n);
+                for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+                    auto & e = cuda_ctx->repack_xq[k];
+                    if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+                    if (e.producer_nbytes == 0) continue;
+                    const char * elo = (const char *) e.producer_data;
+                    const char * ehi = elo + e.producer_nbytes;
+                    if (lo < ehi && elo < hi) e.gen = 0;
+                }
+            };
+
+                // [gfx906-opt P2] before any dispatch: this node will write its output range
+                q8x_invalidate(node);
+
+                // [gfx906 P2.2] F32 grouped mat-vec
+                if (!f32m_member_of.empty()) {
+                    auto it = f32m_member_of.find(node);
+                    if (it != f32m_member_of.end()) {
+                        if (node == it->second->head) {
+                            ggml_cuda_mul_mat_f_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(it->second->mms.data()), it->second->n);
+                        }
+                        continue;
+                    }
+                }
+                // gfx906 q8-multi: non-head members are already produced by the head's
+                // one grouped launch; head launches the group here.
+                if (q8m_g) {
+                    for (int k = 0; k < q8m_g->n; ++k) {
+                        q8x_invalidate(q8m_g->mms[k]);
+                    }
+                    if (node == q8m_g->head) {
+                        ggml_cuda_mul_mat_repacked_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(q8m_g->mms.data()), q8m_g->n);
+                    }
+                    continue;
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    // fused chains write multiple outputs: invalidate each
+                    for (int k = 1; k <= nodes_to_skip; ++k) {
+                        q8x_invalidate(cgraph->nodes[i + k]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5699,6 +6012,29 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    // GCN repacked weights are stored in a non-canonical two-plane layout and can only be consumed
+    // as src0 of MUL_MAT / MUL_MAT_ID by the repacked dispatch. Reject every other use, so the model
+    // loader never places a repacked weight where a canonical-layout op (e.g. GET_ROWS on a Q8_0
+    // embedding) would misread it.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->buffer &&
+            ggml_backend_buft_is_cuda_repack(op->src[i]->buffer->buft)) {
+            if (i != 0) {
+                return false;   // a repacked weight can only be src0
+            }
+            if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+                return false;
+            }
+            if (!ggml_cuda_repack_tensor_supported(op->src[0])) {
+                return false;
+            }
+            if (op->src[1] == nullptr || op->src[1]->type != GGML_TYPE_F32 ||
+                op->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -6165,7 +6501,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+           (ggml_backend_buft_is_cuda_repack(buft) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6336,6 +6673,27 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        static ggml_backend_dev_get_extra_bufts_t fct =
+            [](ggml_backend_dev_t dev) -> ggml_backend_buffer_type_t * {
+                ggml_backend_cuda_device_context * dev_ctx =
+                    (ggml_backend_cuda_device_context *) dev->context;
+                static std::mutex mutex;
+                static std::unordered_map<int, std::vector<ggml_backend_buffer_type_t>> buft_cache;
+                std::lock_guard<std::mutex> lock(mutex);
+                auto & extra_bufts = buft_cache[dev_ctx->device];
+                if (extra_bufts.empty()) {
+                    ggml_backend_buffer_type_t buft =
+                        ggml_backend_cuda_repack_buffer_type(dev_ctx->device);
+                    if (buft) {
+                        extra_bufts.push_back(buft);
+                    }
+                    extra_bufts.push_back(nullptr);
+                }
+                return extra_bufts.data();
+            };
+        return (void *)fct;
     }
     return nullptr;
 }
