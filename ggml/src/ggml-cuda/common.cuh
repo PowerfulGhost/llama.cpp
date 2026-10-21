@@ -1738,7 +1738,8 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 }
 
 // [gfx906] tolerant opt-in / opt-out parsing. Never test `getenv(name) != nullptr`:
-// that makes `VAR=0` mean ON (the P4 hc-up-pre and T10 footguns).
+// that makes `VAR=0` mean ON (the historical helper footguns behind T3's HC up-pre
+// gate and T10's topk gate).
 //   `GFX906_<TECH>_OFF=1|on|true|yes` -> off;  `=0|off|false|no` or unset -> on (def=false).
 // Shared infra owned by T1 (see knowledge/_meta/branch-ledger.md §3).
 static inline bool gfx906_env_on(const char * name, bool def = false) {
