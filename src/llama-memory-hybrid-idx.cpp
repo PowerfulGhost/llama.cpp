@@ -489,7 +489,10 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
         const auto * idx = mem->get_mem_idx();
-        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        // size the pool by the number of streams, not the number of sequences: a unified cache has one
+        // stream shared by every sequence, so multiplying by n_seq_max over-reserves 16x at 1M context
+        // (this is the reserve-side twin of the runtime-side fix in kpool_build_state)
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_stream();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;
@@ -714,8 +717,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     }
 
     // a ubatch touches at most t_s/kpool + 1 pools per sequence, pad to that bound so the graph keeps its shape
-    // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
-    const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
+    // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max.
+    // kv_size is the per-stream size: a non-unified cache has one stream per sequence (n_stream = n_seq_max),
+    // a unified one a single shared stream - multiplying by n_seq_max there over-reserves 16x at 1M context
+    const uint32_t n_pool_max = kv_size / kpool * idx->get_n_stream();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
 }
@@ -732,6 +737,16 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_n_pool_max() const {
+    GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+
+    // per-stream cell count over the pool size, times the number of streams: a non-unified cache gives
+    // every sequence its own stream, a unified one a single shared stream
+    const llama_kv_cache * idx = mem->get_mem_idx();
+
+    return idx->get_size() / mem->get_kpool() * idx->get_n_stream();
 }
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,

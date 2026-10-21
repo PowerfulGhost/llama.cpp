@@ -696,6 +696,64 @@ public:
     uint32_t n_kv  = 0;
 };
 
+// Tolerant parsing of the GGML_LIDX_TOPK knob. It is a mode selector (D16: mode selectors keep
+// their name), with three states:
+//   unset / anything else   auto: the fusion is used when it pays off
+//   0 / off / false / no    the plain path: the full [n_pool, n_tokens] score matrix
+//   2                       force the fusion regardless of the size threshold
+// `getenv(...) != nullptr` would make =0 *enable* the plain path - the footgun the tolerant
+// convention exists for. The shared helper gfx906_env_on() lives in T1's common.cuh, so the
+// parser stays local here (same as the T6/T7/T8 knobs).
+static bool qsa_ldxtk_env_off(const char * v) {
+    if (v == nullptr || *v == '\0') {
+        return false;
+    }
+    return strcmp(v, "0") == 0 || strcmp(v, "off") == 0 ||
+           strcmp(v, "false") == 0 || strcmp(v, "no") == 0;
+}
+
+// QSA top-k fusion (GGML_LIDX_TOPK, default on): the [n_pool, n_tokens] f32 score matrix is the
+// largest compute-buffer item at long context (2 GiB per layer at 16x128k), so the pool is scored in
+// chunks and a per-chunk top-k is streamed instead. The scores are identical, only the order of exact
+// score ties can differ.
+//
+// The decision must not depend on the current pool count: the reserve graph walks the full pool while
+// a runtime graph walks the pools of the moment, and a different choice gives the two graphs a
+// different topology, which forces a gallocr re-reserve plus an 8-device sync on every ubatch
+// (see the T10 card). The worst-case pool count and the ubatch size are the same in both graphs.
+//
+// n_top_sel is the width of the selection: with the fusion it is the worst-case width, so the graph
+// keeps its shape when the pool is still small (the extra slots are dead and get masked out).
+static bool qsa_ldxtk_plan(
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        const llama_cparams &                  cparams,
+        const llama_hparams &                  hparams,
+        int64_t &                              n_top_sel) {
+    static const char * const env_val        = getenv("GGML_LIDX_TOPK");
+    static const bool        env_ldxtk       = !qsa_ldxtk_env_off(env_val);
+    static const bool        env_ldxtk_force = env_val && strcmp(env_val, "2") == 0;
+
+    const int64_t kpool      = hparams.indexer_kpool;
+    const int64_t n_pool_max = mctx_hyb->get_n_pool_max();
+    const int64_t n_ubatch   = std::min<int64_t>(cparams.n_ctx, cparams.n_ubatch);
+    const int64_t n_top_max  = std::min<int64_t>(n_pool_max, hparams.indexer_top_k / kpool);
+
+    n_top_sel = 0;
+
+    if (!env_ldxtk_force && !(env_ldxtk && n_pool_max * n_ubatch >= (1LL << 28))) {
+        return false;
+    }
+
+    // the reduce kernel only has the 256/512/1024 wide instantiations
+    if (n_top_max != 256 && n_top_max != 512 && n_top_max != 1024) {
+        return false;
+    }
+
+    n_top_sel = n_top_max;
+
+    return true;
+}
+
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
     const auto * mctx_idx = mctx_hyb->get_idx();
     GGML_ASSERT(mctx_idx != nullptr);
@@ -723,8 +781,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
-    // the top blocks plus the tail
-    inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    // the top blocks plus the tail: with the fusion the width is the worst-case one, so the shape of the
+    // graph does not change while the pool grows (the slots beyond the pool are dead and get masked out)
+    int64_t n_top_sel = 0;
+    const bool use_ldxtk = qsa_ldxtk_plan(mctx_hyb, cparams, hparams, n_top_sel);
+    inp->n_sel = use_ldxtk ? (int64_t) kpool*n_top_sel + kpool - 1
+                           : (int64_t) kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -806,12 +868,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    cb(score, "indexer_score", il);
 
-    const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
+    // QSA top-k fusion (GGML_LIDX_TOPK, default on): see qsa_ldxtk_plan. The decision is taken from the
+    // worst-case pool count and the ubatch size, so the reserve graph and the runtime graphs have the
+    // same topology and the compute-buffer plan stays valid (see the T10 card).
+    int64_t n_top_sel = 0;
+    const bool use_ldxtk = qsa_ldxtk_plan(mctx_hyb, cparams, hparams, n_top_sel);
+
+    // the width of the selection: with the fusion it is the worst-case width (the slots beyond the
+    // current pool are dead), without it the pool is shorter than the top-k
+    const int64_t n_top_pool = use_ldxtk ? n_top_sel : std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+
+    ggml_tensor * score     = nullptr;
+    ggml_tensor * top_k     = nullptr;
+    ggml_tensor * top_score = nullptr;
+    if (use_ldxtk) {
+        constexpr int32_t LDXTK_CHUNK = 16384;
+        ggml_tensor * partial = ggml_ldxtk_chunk(ctx0, q, pooled, weights, inp_kpool->pool_mask,
+                (int32_t) n_top_pool, LDXTK_CHUNK);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, partial, il});
+        cb(partial, "indexer_score", il);
+
+        // top2: [2, n_top_pool, n_tokens], plane 0 = top scores, plane 1 = top pool indices
+        ggml_tensor * top2 = ggml_ldxtk_merge(ctx0, partial, (int32_t) n_top_pool, LDXTK_CHUNK);
+        const size_t plane_bytes = (size_t) n_top_pool * n_tokens * 4;
+        // the dead slots carry the index -1: clamp it to a valid row, the score plane marks them dead
+        // and the selection mask drops them
+        ggml_tensor * top_idx = ggml_clamp(ctx0,
+                ggml_view_2d(ctx0, top2, n_top_pool, n_tokens, (size_t) n_top_pool*4, plane_bytes),
+                0.0f, 2147483647.0f);
+        top_k = ggml_reshape_1d(ctx0, ggml_cast(ctx0, top_idx, GGML_TYPE_I32), n_top_pool*n_tokens);
+        top_score = ggml_reshape_3d(ctx0,
+                ggml_view_2d(ctx0, top2, n_top_pool, n_tokens, (size_t) n_top_pool*4, 0),
+                1, n_top_pool, n_tokens);
+    } else {
+        score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        cb(score, "indexer_score", il);
+        top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
+    }
     cb(top_k, "indexer_top_k", il);
 
     // the top blocks, then the incomplete tail with n_kv for missing cells
@@ -844,7 +939,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
     // some cells from several threads: map every dead slot to its own dump row, idx = dump + live*(idx - dump)
     // a picked pool is live when visible: a visible score is a rectified sum >= 0, an invisible one is -inf
-    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
+    if (!use_ldxtk) {
+        // [1, n_top_pool, n_tokens]
+        top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k);
+    }
     ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
     live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
     // a tail cell is live unless it is the n_kv sentinel

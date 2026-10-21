@@ -12432,3 +12432,187 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_ldxtk_chunk
+
+// (score desc, dead padding last, lower pool index first)
+static inline bool ldxtk_pair_before(float score_a, float idx_a, float score_b, float idx_b) {
+    if (score_a != score_b) {
+        return score_a > score_b;
+    }
+    const bool dead_a = idx_a < 0.0f;
+    const bool dead_b = idx_b < 0.0f;
+    if (dead_a != dead_b) {
+        return !dead_a;
+    }
+    return idx_a < idx_b;
+}
+
+// CPU reference for the QSA lightning-indexer score + top-k fusion (see ggml.h).
+// The score math is identical to ggml_compute_forward_lightning_indexer; only the
+// selection of exact score ties is deterministic (lower pool index first).
+void ggml_compute_forward_ldxtk_chunk(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2]; // weights
+    const ggml_tensor * m = dst->src[3]; // mask
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(   q->type == GGML_TYPE_F32);
+    GGML_ASSERT(   w->type == GGML_TYPE_F32);
+    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+
+    const int32_t n_top  = dst->op_params[0];
+    const int32_t chunk  = dst->op_params[1];
+
+    const int n_embd   = q->ne[0];
+    const int n_head   = q->ne[1];
+    const int n_tokens = q->ne[2];
+    const int n_kv     = k->ne[2];
+    const int n_chunks = (n_kv + chunk - 1) / chunk;
+    const int n_half   = (chunk + 8191) / 8192;  // sub-chunks per chunk (mirrors the CUDA kernel)
+
+    float * scratch = (float *) dst->data;                  // [n_tokens, chunk]
+    float * partial = scratch + n_tokens * chunk;           // [n_chunks*n_half, n_tokens, n_top, 2]
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "ldxtk_chunk: unsupported K-type");
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    float * k_row_f32 = (float *) params->wdata + ith*(1*n_embd + CACHE_LINE_SIZE_F32);
+
+    for (int c = 0; c < n_chunks; ++c) {
+        const int kv0 = c * chunk;
+        const int kvn = std::min(chunk, n_kv - kv0);
+
+        for (int t = ith; t < n_tokens; t += nth) {
+            float * row = scratch + t*chunk;
+            for (int i = 0; i < chunk; ++i) {
+                row[i] = -INFINITY;
+            }
+
+            const float * w_row = (const float *)     ((const char *) w->data + t*w->nb[1]);
+            const ggml_fp16_t * m_row = (const ggml_fp16_t *) ((const char *) m->data + t*m->nb[1]);
+
+            for (int ik = 0; ik < kvn; ++ik) {
+                char * k_row = (char *) k->data + (kv0 + ik)*k->nb[2];
+                if (k_to_float) {
+                    k_to_float(k_row, k_row_f32, n_embd);
+                } else {
+                    k_row_f32 = (float *) k_row;
+                }
+
+                float score = 0.0f;
+                for (int h = 0; h < n_head; ++h) {
+                    float qk = 0.0f;
+                    const float * q_row = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2]);
+                    ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row_f32, 0, 1);
+                    score += MAX(qk, 0.0f) * w_row[h];
+                }
+
+                row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[kv0 + ik]);
+            }
+
+            // top-n_top of each 8192-wide sub-chunk (mirrors the CUDA kernel)
+            for (int h = 0; h < n_half; ++h) {
+                const int off = h * 8192;
+                const int kvn_h = std::min(8192, kvn - off);
+
+                // a skipped sub-chunk still owns a table slot: write it as fully
+                // dead so the blob is fully defined
+                if (kvn_h <= 0) {
+                    for (int i = 0; i < n_top; ++i) {
+                        float * out = partial + ((c*n_half + h)*n_tokens + t)*n_top*2 + i*2;
+                        out[0] = -INFINITY;
+                        out[1] = -1.0f;
+                    }
+                    continue;
+                }
+
+                float best_s[1024];
+                float best_x[1024];
+                for (int i = 0; i < n_top; ++i) {
+                    best_s[i] = -INFINITY;
+                    best_x[i] = -1.0f;
+                }
+                for (int ik = 0; ik < kvn_h; ++ik) {
+                    const float s = row[off + ik];
+                    for (int i = 0; i < n_top; ++i) {
+                        if (ldxtk_pair_before(s, (float) ik, best_s[i], best_x[i])) {
+                            for (int r = n_top - 1; r > i; --r) {
+                                best_s[r] = best_s[r - 1];
+                                best_x[r] = best_x[r - 1];
+                            }
+                            best_s[i] = s;
+                            best_x[i] = (float) ik;
+                            break;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < n_top; ++i) {
+                    float * out = partial + ((c*n_half + h)*n_tokens + t)*n_top*2 + i*2;
+                    out[0] = best_s[i];
+                    out[1] = best_x[i] >= 0.0f ? (float) (kv0 + off + best_x[i]) : -1.0f;
+                }
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_ldxtk_merge
+
+void ggml_compute_forward_ldxtk_merge(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const ggml_tensor * partial = dst->src[0];
+
+    GGML_ASSERT(partial->op == GGML_OP_LIDX_TOPK_CHUNK);
+
+    const int32_t n_top  = partial->op_params[0];
+    const int32_t chunk  = partial->op_params[1];
+
+    const ggml_tensor * q   = partial->src[0];
+    const int n_tokens = q->ne[2];
+    const int n_kv     = partial->src[1]->ne[2];
+    const int n_chunks = (n_kv + chunk - 1) / chunk;
+    const int n_tables = n_chunks * ((chunk + 8191) / 8192);
+
+    const float * p = (const float *) partial->data + n_tokens*chunk; // skip the scratch
+    float * dst_d   = (float *) dst->data;                           // [2, n_top, n_tokens]
+
+    struct cand {
+        float s;
+        float x;
+    };
+    std::vector<cand> cands;
+    cands.reserve(n_tables * n_top);
+
+    for (int t = ith; t < n_tokens; t += nth) {
+        cands.clear();
+        for (int c = 0; c < n_tables; ++c) {
+            for (int i = 0; i < n_top; ++i) {
+                const float * pr = p + (c*n_tokens + t)*n_top*2 + i*2;
+                cands.push_back({pr[0], pr[1]});
+            }
+        }
+        std::sort(cands.begin(), cands.end(),
+                [](const cand & a, const cand & b) {
+                    return ldxtk_pair_before(a.s, a.x, b.s, b.x);
+                });
+        for (int i = 0; i < n_top; ++i) {
+            const float s = i < (int) cands.size() ? cands[i].s : -INFINITY;
+            const float x = i < (int) cands.size() ? cands[i].x : -1.0f;
+            dst_d[0*n_top*n_tokens + t*n_top + i] = s;
+            dst_d[1*n_top*n_tokens + t*n_top + i] = x;
+        }
+    }
+}

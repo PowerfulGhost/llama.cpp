@@ -793,3 +793,807 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
             return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// QSA lightning-indexer score + top-k fusion (GGML_OP_LIDX_TOPK_CHUNK / _MERGE)
+//
+// The score of every pool cell is computed with the very same tile/vec kernels as
+// ggml_lightning_indexer, but restricted to a chunk of the pool: each chunk is
+// scored into the op's scratch region and immediately reduced to a per-chunk
+// top-N_TOP table of (score, pool index) pairs. A second op merges the chunk
+// tables. This avoids materializing the full [n_pool, n_tokens] f32 score matrix
+// (multi-GiB at long context) in the compute buffer.
+//
+// Selection semantics: scores identical to ggml_lightning_indexer; the top-N_TOP
+// set is deterministic (score descending, dead padding last, then lower pool
+// index first) - exact score ties may be ordered differently than ggml_top_k.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ bool ldxtk_pair_before(const float2 & a, const float2 & b) {
+    if (a.x != b.x) {
+        return a.x > b.x;
+    }
+    const bool da = a.y < 0.0f;
+    const bool db = b.y < 0.0f;
+    if (da != db) {
+        return !da;
+    }
+    return a.y < b.y;
+}
+
+// insertion sort of N register pairs in ldxtk order (best first)
+template <int N>
+static __device__ void ldxtk_sort_regs(float2 * a) {
+#pragma unroll
+    for (int i = 1; i < N; ++i) {
+        float2 v = a[i];
+        int j = i;
+        while (j > 0 && ldxtk_pair_before(v, a[j - 1])) {
+            a[j] = a[j - 1];
+            --j;
+        }
+        a[j] = v;
+    }
+}
+
+// float -> orderable uint32 (larger float maps to larger uint; -inf -> smallest)
+static __device__ __forceinline__ uint32_t ldxtk_ord(const float v) {
+    const uint32_t u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// descending value-only bitonic sort of N shared floats (256 threads)
+template <int N>
+static __device__ void ldxtk_bitonic_sh_f(float * s, const int tl) {
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tl; i < N; i += 256) {
+                const int p = i ^ j;
+                if (p > i) {
+                    float & a = s[i];
+                    float & b = s[p];
+                    const bool up = ((i & k) == 0);
+                    if (up ? (b > a) : (a > b)) {
+                        const float t = a; a = b; b = t;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// bitonic sort of N shared pairs in ldxtk order (best first), 256 threads
+// (full bitonic network: every (i, i^j) pair is exchanged by its lower index;
+// the loop must cover all N positions, not just N/2)
+template <int N>
+static __device__ void ldxtk_bitonic_sh(float2 * s, const int tl) {
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tl; i < N; i += 256) {
+                const int p = i ^ j;
+                if (p > i) {
+                    float2 & a = s[i];
+                    float2 & b = s[p];
+                    const bool up = ((i & k) == 0);
+                    if (up ? ldxtk_pair_before(b, a) : ldxtk_pair_before(a, b)) {
+                        float2 t = a; a = b; b = t;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// fill the scratch tail of a chunk (positions [n_valid, chunk)) with -inf so the
+// scratch region is fully defined (the CPU reference writes -inf there too)
+static __global__ void ldxtk_scratch_fill_kernel(float * scratch, int64_t n_valid, int64_t chunk, int64_t n_tokens) {
+    const int64_t t = blockIdx.x;
+    for (int64_t i = n_valid + threadIdx.x; i < chunk; i += 256) {
+        scratch[t * chunk + i] = -INFINITY;
+    }
+}
+
+// One block (256 threads) per (token, sub-chunk). Each thread holds 32
+// candidates (real or dead padding); the 32 are sorted once in registers and
+// the full top-N_TOP of the block's <= 8192 candidates is selected with a
+// shared-memory bitonic sort (64 KiB).
+//
+// MODE 0 (SCORE):  candidates are chunk scores in a scratch row (src_s),
+//                  idx = kv0 + pos; the N_TOP pairs are written contiguously.
+// MODE 1 (TABLE):  candidates are (score, idx) pairs of a table stack
+//                  [n_tables, n_tokens, N_TOP] (src_p, idx already global);
+//                  the N_TOP pairs are written contiguously.
+// MODE 2 (SPLIT):  like TABLE, but the pairs are split into two strided planes
+//                  (out = score plane, out1 = index plane, stride n_tokens).
+template <int N_TOP, int MODE>
+static __global__ void __launch_bounds__(256, 1) lidxtk_reduce_kernel(
+        const float * src_s,    // MODE 0: scratch base, token row stride src_stride
+        const float * src_p,    // MODE 1/2: table base (token row stride N_TOP)
+        int64_t n_cand,         // <= 8192
+        int64_t n_tokens,
+        float * out,            // MODE 0/1: contiguous pairs; MODE 2: score plane (float)
+        float * out1,           // MODE 2: index plane (float)
+        int64_t kv0,            // MODE 0: global index offset
+        int64_t src_stride,     // MODE 0: floats per token row
+        int64_t tab_stride) {   // MODE 1: float2 per table (n_tokens * N_TOP)
+
+    constexpr int N_PER_THREAD = 32;
+    constexpr int N_CAND_MAX   = 256 * N_PER_THREAD;  // 8192
+
+    const int tl = threadIdx.x;
+    const int t  = blockIdx.x;
+
+    const float2 DEAD = make_float2(-INFINITY, -1.0f);
+
+    const float2 * src_p_t = (const float2 *) src_p + (MODE == 0 ? 0 : (size_t) t * N_TOP);
+    const float * src_s_t = src_s + t * src_stride;
+
+    float2 keep[N_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < N_PER_THREAD; ++i) {
+        const int p = tl + i * 256;
+        if (p < n_cand) {
+            if (MODE == 0) {
+                keep[i] = make_float2(src_s_t[p], (float) (kv0 + p));
+            } else if (MODE == 2) {
+                keep[i] = src_p_t[p];
+            } else {
+                // MODE 1: table stack [n_tables, n_tokens, N_TOP] - table-major
+                keep[i] = src_p_t[(p / N_TOP) * tab_stride + (p % N_TOP)];
+            }
+        } else {
+            keep[i] = DEAD;
+        }
+    }
+
+    ldxtk_sort_regs<N_PER_THREAD>(keep);
+
+    __shared__ float2 sh[N_CAND_MAX];  // 64 KiB
+
+#pragma unroll
+    for (int i = 0; i < N_PER_THREAD; ++i) {
+        sh[tl * N_PER_THREAD + i] = keep[i];
+    }
+    __syncthreads();
+
+    ldxtk_bitonic_sh<N_CAND_MAX>(sh, tl);
+
+#pragma unroll
+    for (int i = tl; i < N_TOP; i += 256) {
+        const float2 v = sh[i];
+        if (MODE == 2) {
+            // the merge output is [2, n_top, n_tokens]: the slot index is the fastest axis,
+            // so that a [n_top, n_tokens] view of the plane reads the slots of one token
+            out[t * N_TOP + i]  = v.x;
+            out1[t * N_TOP + i] = v.y;
+        } else {
+            ((float2 *) out)[(size_t) t * N_TOP + i] = v;
+        }
+    }
+}
+
+// Radix top-N_TOP for large candidate sets (n_cand > 2048). The old kernel's full
+// bitonic sort of 8192 pairs (91 barrier stages, 64 KiB, ~50 us per block on MI50)
+// was the bottleneck of the fused path; this narrows the candidates with shared
+// radix rounds (10+8+8+6 bits) instead, then finalizes with a small bitonic:
+//
+//   pass 1:  load the n_cand values into shared
+//   rounds:  histogram the top bits, find the cutoff bin, gather survivors in place
+//   final:   sort the <= 1024 survivors, threshold = N_TOP-th value, then re-scan
+//            the global input keeping {v > thr} plus the first (N_TOP - A) ties in
+//            scan order (which also matches the reference's lower-index-first ties)
+//
+// MODE 0 (SCORE): values from the scratch row, idx = kv0 + pos.
+// MODE 1 (TABLE): (score, idx) pairs of a table stack [n_tables, n_tokens, N_TOP],
+//                 idx already global, strided by tab_stride float2 per table.
+// MODE 2 (SPLIT): like TABLE, but the output is split into two strided planes.
+template <int N_TOP, int MODE>
+static __global__ void __launch_bounds__(256, 1) lidxtk_reduce_radix_kernel(
+        const float * src_s,    // MODE 0: scratch base, token row stride src_stride
+        const float * src_p,    // MODE 1/2: table base (token row stride N_TOP)
+        int64_t n_cand,         // <= 8192
+        int64_t n_tokens,
+        float * out,            // MODE 0/1: contiguous pairs; MODE 2: score plane (float)
+        float * out1,           // MODE 2: index plane (float)
+        int64_t kv0,            // MODE 0: global index offset
+        int64_t src_stride,     // MODE 0: floats per token row
+        int64_t tab_stride) {   // MODE 1: float2 per table (n_tokens * N_TOP)
+
+    constexpr int N_CAND_MAX = 8192;
+
+    const int tl = threadIdx.x;
+    const int t  = blockIdx.x;
+
+    const float2 DEAD = make_float2(-INFINITY, -1.0f);
+
+    const float2 * src_p_t = (const float2 *) src_p + (MODE == 0 ? 0 : (size_t) t * N_TOP);
+    const float * src_s_t  = src_s + t * src_stride;
+
+    __shared__ float    sv[N_CAND_MAX];   // 32 KiB
+    __shared__ uint32_t hist[1032];       // 1024 bins + 4 front + 4 safe wavefront totals
+    __shared__ float2   keep[1024];       // 8 KiB
+    __shared__ uint8_t  tie_mark[N_CAND_MAX];  // 8 KiB
+    __shared__ float    warp_min[4];      // 256 threads = 4 wavefronts (64 lanes)
+    __shared__ int      s_m, s_cut, s_above, s_keep, s_ties;
+    __shared__ float    s_min;
+
+    auto val_at = [&](int i) -> float {
+        if (MODE == 0) {
+            return src_s_t[i];
+        } else if (MODE == 2) {
+            return src_p_t[i].x;
+        } else {
+            return src_p_t[(i / N_TOP) * tab_stride + (i % N_TOP)].x;
+        }
+    };
+    auto idx_at = [&](int i) -> float {
+        if (MODE == 0) {
+            return (float) (kv0 + i);
+        } else if (MODE == 2) {
+            return src_p_t[i].y;
+        } else {
+            return src_p_t[(i / N_TOP) * tab_stride + (i % N_TOP)].y;
+        }
+    };
+
+    if (n_cand == 0) {
+        // all-dead table
+#pragma unroll
+        for (int i = tl; i < N_TOP; i += 256) {
+            if (MODE == 2) {
+                out[i * n_tokens + t]  = -INFINITY;
+                out1[i * n_tokens + t] = -1.0f;
+            } else {
+                ((float2 *) out)[(size_t) t * N_TOP + i] = DEAD;
+            }
+        }
+        return;
+    }
+
+    // pass 1: load values
+    for (int i = tl; i < n_cand; i += 256) {
+        sv[i] = val_at(i);
+    }
+    __syncthreads();
+
+    // Radix rounds: 10 + 8 + 8 + 6 bits.
+    // State: sv[0..f) = frontier (still to be refined), sv[f..m) = safe (definitely
+    // in the top N_TOP). Each round re-buckets the FRONTIER only, by the next bits
+    // (valid because all frontier values share the bits above): bins strictly above
+    // the cutoff join the safe region, exactly the cutoff bin becomes the new
+    // frontier, the rest is dropped. (Bucketsing the whole survivor set instead
+    // would order values of different upper bins wrongly across the next bits.)
+    // Race-free gather: the frontier is loaded into registers first, and only then
+    // is shared memory written.
+    int m = n_cand;
+    int f = n_cand;
+    constexpr int shifts[4]    = {22, 14, 6, 0};
+    constexpr int nbins_arr[4] = {1024, 256, 256, 64};
+    float r[32];
+    float rm[32];  // staging for the safe-region move
+    const int wf = tl >> 6;
+    const int lane = tl & 63;
+    #pragma unroll
+    for (int rr = 0; rr < 4; ++rr) {
+        const int safe_n = m - f;
+        const int need   = N_TOP - safe_n;  // values still to be taken from the frontier
+        if (need <= 0) break;               // the safe region alone fills the top
+        if (f <= need) break;               // the whole frontier is selected
+        const int nbins = nbins_arr[rr];
+        const int shift = shifts[rr];
+        const int n_local = std::min(32, f - tl * 32);  // may be <= 0
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i < n_local) r[i] = sv[tl * 32 + i];
+        }
+        for (int b = tl; b < nbins; b += 256) hist[b] = 0;
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i < n_local) {
+                atomicAdd(&hist[(ldxtk_ord(r[i]) >> shift) & (nbins - 1)], 1u);
+            }
+        }
+        __syncthreads();
+        // cutoff: T = f - need frontier values are not selected; cut = the first bin
+        // (ascending) with cumulative C[bin] > T. One full wavefront (64 lanes on
+        // gfx906) handles the nbins/64 slices; the lanes with x <= T are a monotone
+        // prefix, so its length is the popcount of the ballot mask.
+        if (tl < 64) {
+            const int slice = nbins / 64;
+            uint32_t c = 0;
+            for (int b = tl * slice; b < (tl + 1) * slice; ++b) c += hist[b];
+            uint32_t x = c;  // inclusive prefix of slice sums
+#pragma unroll
+            for (int d = 1; d < 64; d <<= 1) {
+                const uint32_t y = __shfl_up_sync(0xffffffffffffffffull, x, d, 64);
+                if (tl >= d) x += y;
+            }
+            const uint32_t T = (uint32_t) (f - need);
+            const uint64_t mask = __ballot_sync(0xffffffffffffffffull, x <= T);
+            const int cross = (mask == 0) ? 0 : (int) __popcll(mask);
+            if (tl == cross) {
+                uint32_t cc = (cross == 0) ? 0 : (x - c);  // prefix before this slice
+                int b = cross * slice;
+                for (int i = 0; i < slice; ++i) {
+                    cc += hist[cross * slice + i];
+                    if (cc > T) {
+                        b = cross * slice + i;
+                        break;
+                    }
+                }
+                s_cut = b;
+            }
+        }
+        __syncthreads();
+        const int cut = s_cut;
+        // per-thread counts: new frontier (bin == cut) and new safe (bin > cut)
+        int n_front = 0, n_safe = 0;
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i < n_local) {
+                const uint32_t b = (ldxtk_ord(r[i]) >> shift) & (nbins - 1);
+                if (b == (uint32_t) cut) ++n_front;
+                else if (b > (uint32_t) cut) ++n_safe;
+            }
+        }
+        // exclusive block prefixes of n_front and n_safe (wavefront prefix +
+        // cross-wavefront totals). Both chains are shuffle-only; the totals are
+        // published to disjoint shared slots after a single barrier (reusing one
+        // slot range for both would race: the second write can land before other
+        // wavefronts finished reading the first).
+        int xf = n_front;
+#pragma unroll
+        for (int d = 1; d < 64; d <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffffffffffull, xf, d, 64);
+            if (lane >= d) xf += y;
+        }
+        int xs = n_safe;
+#pragma unroll
+        for (int d = 1; d < 64; d <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffffffffffull, xs, d, 64);
+            if (lane >= d) xs += y;
+        }
+        if (lane == 63) {
+            hist[1024 + wf] = (uint32_t) xf;
+            hist[1028 + wf] = (uint32_t) xs;
+        }
+        __syncthreads();
+        int base_front = xf - n_front;
+        if (wf > 0) base_front += (int) hist[1024 + wf - 1];
+        if (wf > 1) base_front += (int) hist[1024 + wf - 2];
+        if (wf > 2) base_front += (int) hist[1024 + wf - 3];
+        const int f2 = (int) (hist[1024] + hist[1025] + hist[1026] + hist[1027]);
+        int base_safe = xs - n_safe;
+        if (wf > 0) base_safe += (int) hist[1028 + wf - 1];
+        if (wf > 1) base_safe += (int) hist[1028 + wf - 2];
+        if (wf > 2) base_safe += (int) hist[1028 + wf - 3];
+        const int s2 = (int) (hist[1028] + hist[1029] + hist[1030] + hist[1031]);
+        // move the safe region [f, m) to [f2, f2 + safe_n). The copy overlaps
+        // itself (f2 <= f) and a strided multi-thread copy has no cross-thread
+        // ordering, so stage the slice in registers first.
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            const int j = tl + i * 256;
+            if (j < safe_n) rm[i] = sv[f + j];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            const int j = tl + i * 256;
+            if (j < safe_n) sv[f2 + j] = rm[i];
+        }
+        __syncthreads();
+        // gather: new frontier -> [0, f2), safe_new -> [f2 + safe_n, ...)
+        int cf = 0, cs = 0;
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i < n_local) {
+                const uint32_t b = (ldxtk_ord(r[i]) >> shift) & (nbins - 1);
+                if (b == (uint32_t) cut) {
+                    sv[base_front + cf] = r[i];
+                    ++cf;
+                } else if (b > (uint32_t) cut) {
+                    sv[f2 + safe_n + base_safe + cs] = r[i];
+                    ++cs;
+                }
+            }
+        }
+        __syncthreads();
+        f = f2;
+        m = f2 + safe_n + s2;
+    }
+    __syncthreads();
+
+    // threshold for the keep pass: the minimum of the selected values. The
+    // selection is the safe region plus (the whole frontier, or `need` of its
+    // bit-identical members after 4 rounds); in either case the minimum of the
+    // frontier (or of the whole safe region when it alone fills the top) is it.
+    float thr;
+    {
+        const int safe_n = m - f;
+        const int lo = (m < N_TOP || N_TOP - safe_n > 0) ? 0 : f;
+        const int hi = (m < N_TOP || N_TOP - safe_n > 0) ? f : m;
+        float mn = INFINITY;
+        for (int i = tl; i < hi - lo; i += 256) mn = mn < sv[lo + i] ? mn : sv[lo + i];
+        for (int d = 32; d > 0; d >>= 1) {
+            const float y = __shfl_xor_sync(0xffffffffffffffffull, mn, d, 64);
+            mn = mn < y ? mn : y;
+        }
+        if ((tl & 63) == 0) {
+            warp_min[tl >> 6] = mn;
+        }
+        __syncthreads();
+        if (tl == 0) {
+            float x = INFINITY;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) x = x < warp_min[w] ? x : warp_min[w];
+            s_min = x;
+        }
+        __syncthreads();
+        thr = s_min;
+    }
+    __syncthreads();
+
+    // keep pass: collect the {v > thr} pairs plus the lowest-index `need` of the
+    // {v == thr} ties (matching the CPU reference's index-ordered tie-breaking).
+    s_above = 0;
+    s_ties = 0;
+    __syncthreads();
+    for (int i = tl; i < n_cand; i += 256) {
+        const float v = val_at(i);
+        tie_mark[i] = 0;
+        if (v > thr) {
+            atomicAdd(&s_above, 1);
+        } else if (v == thr) {
+            tie_mark[i] = 1;
+            atomicAdd(&s_ties, 1);
+        }
+    }
+    __syncthreads();
+    const int above = s_above;
+    int need = N_TOP - above;
+    if (need < 0) need = 0;
+
+    s_keep = 0;
+    __syncthreads();
+    for (int i = tl; i < n_cand; i += 256) {
+        const float v = val_at(i);
+        if (v > thr) {
+            const int j = atomicAdd(&s_keep, 1);
+            if (j < 1024) keep[j] = make_float2(v, idx_at(i));
+        }
+    }
+    __syncthreads();
+    // the ties: keep the lowest-index `need`. Each thread owns a contiguous 32-slot
+    // chunk (256 x 32 = 8192 >= n_cand) so the block prefix over the per-chunk tie
+    // counts is a true index-order prefix.
+    if (need > 0) {
+        const int i0 = tl * 32;
+        uint32_t c = 0;
+        #pragma unroll
+        for (int c2 = 0; c2 < 32; ++c2) {
+            const int i = i0 + c2;
+            c += (i < n_cand && tie_mark[i]) ? 1u : 0u;
+        }
+        int x = (int) c;
+#pragma unroll
+        for (int d = 1; d < 64; d <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffffffffffull, x, d, 64);
+            if (lane >= d) x += y;
+        }
+        if (lane == 63) hist[1024 + wf] = (uint32_t) x;
+        __syncthreads();
+        int base = x - (int) c;
+        if (wf > 0) base += (int) hist[1024 + wf - 1];
+        if (wf > 1) base += (int) hist[1024 + wf - 2];
+        if (wf > 2) base += (int) hist[1024 + wf - 3];
+        int lr = 0;
+        #pragma unroll
+        for (int c2 = 0; c2 < 32; ++c2) {
+            const int i = i0 + c2;
+            if (i < n_cand && tie_mark[i]) {
+                if (base + lr < need && above + base + lr < 1024) keep[above + base + lr] = make_float2(thr, idx_at(i));
+                ++lr;
+            }
+        }
+    }
+    __syncthreads();
+
+    // pad and sort the kept pairs, then write the top N_TOP
+    const int n_keep = std::min(above + std::min(need, (int) s_ties), 1024);
+    for (int i = n_keep + tl; i < 1024; i += 256) keep[i] = DEAD;
+    __syncthreads();
+    ldxtk_bitonic_sh<1024>(keep, tl);
+    __syncthreads();
+#pragma unroll
+    for (int i = tl; i < N_TOP; i += 256) {
+        const float2 v = keep[i];
+        if (MODE == 2) {
+            // the merge output is [2, n_top, n_tokens]: the slot index is the fastest axis,
+            // so that a [n_top, n_tokens] view of the plane reads the slots of one token
+            out[t * N_TOP + i]  = v.x;
+            out1[t * N_TOP + i] = v.y;
+        } else {
+            ((float2 *) out)[(size_t) t * N_TOP + i] = v;
+        }
+    }
+}
+
+#define LDXTK_LAUNCH_REDUCER(MODE)                                                                              \
+    static void ldxtk_launch_reducer_##MODE(                                                                    \
+            int n_top, const float * src_s, const float * src_p, int64_t n_cand,                                \
+            int64_t n_tokens, float * out, float * out1, int64_t kv0, int64_t src_stride, int64_t tab_stride,  \
+            cudaStream_t stream) {                                                                              \
+        if (n_top == 256) {                                                                                     \
+            if (n_cand > 2048) {                                                                               \
+                lidxtk_reduce_radix_kernel<256, MODE>  <<<n_tokens, 256, 0, stream>>>(src_s, src_p, n_cand, n_tokens, out, out1, kv0, src_stride, tab_stride); \
+            } else {                                                                                           \
+                lidxtk_reduce_kernel<256, MODE>  <<<n_tokens, 256, 0, stream>>>(src_s, src_p, n_cand, n_tokens, out, out1, kv0, src_stride, tab_stride); \
+            }                                                                                                  \
+            return;                                                                                             \
+        }                                                                                                       \
+        if (n_top == 512) {                                                                                     \
+            if (n_cand > 2048) {                                                                               \
+                lidxtk_reduce_radix_kernel<512, MODE>  <<<n_tokens, 256, 0, stream>>>(src_s, src_p, n_cand, n_tokens, out, out1, kv0, src_stride, tab_stride); \
+            } else {                                                                                           \
+                lidxtk_reduce_kernel<512, MODE>  <<<n_tokens, 256, 0, stream>>>(src_s, src_p, n_cand, n_tokens, out, out1, kv0, src_stride, tab_stride); \
+            }                                                                                                  \
+            return;                                                                                             \
+        }                                                                                                       \
+        if (n_top == 1024) {                                                                                    \
+            if (n_cand > 2048) {                                                                               \
+                lidxtk_reduce_radix_kernel<1024, MODE> <<<n_tokens, 256, 0, stream>>>(src_s, src_p, n_cand, n_tokens, out, out1, kv0, src_stride, tab_stride); \
+            } else {                                                                                           \
+                lidxtk_reduce_kernel<1024, MODE> <<<n_tokens, 256, 0, stream>>>(src_s, src_p, n_cand, n_tokens, out, out1, kv0, src_stride, tab_stride); \
+            }                                                                                                  \
+            return;                                                                                             \
+        }                                                                                                       \
+        GGML_ABORT("ldxtk: unsupported n_top");                                                                 \
+    }
+
+LDXTK_LAUNCH_REDUCER(0)
+LDXTK_LAUNCH_REDUCER(1)
+LDXTK_LAUNCH_REDUCER(2)
+
+// score one pool chunk with the plain tile/vec kernel into the scratch row
+// layout [n_tokens, chunk] (dst row stride nb1 = chunk, nb3 = 0)
+static void ggml_cuda_ldxtk_score_chunk(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * dst_blob,
+        int64_t c) {
+
+    const ggml_tensor * q = dst_blob->src[0];
+    const ggml_tensor * k = dst_blob->src[1];
+    const ggml_tensor * w = dst_blob->src[2]; // weights
+    const ggml_tensor * m = dst_blob->src[3]; // mask
+
+    const int32_t chunk = dst_blob->op_params[1];
+
+    GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek,  k, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk,  k, nb)
+    GGML_TENSOR_LOCALS(int64_t, new,  w, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbw,  w, nb)
+    GGML_TENSOR_LOCALS(int64_t, nem,  m, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbm,  m, nb)
+
+    const int n_stream = 1;
+    const int n_batch  = q->ne[2];
+    const int n_kv     = std::min<int64_t>(chunk, k->ne[2] - c * chunk);
+    GGML_ASSERT(n_kv > 0);
+
+    const float * q_d   = (const float *) q->data;
+    const char  * k_d   = (const char *)  k->data + c * chunk * nbk2;
+    const float * w_d   = (const float *) w->data;
+    const half  * m_d   = (const half *)  m->data + c * chunk;
+    float       * dst_d = (float *) ((char *) dst_blob->data);
+
+    // dst scratch rows are [n_tokens, chunk]; the kernel strides rows by nb1
+    const size_t nb1 = (size_t) chunk * sizeof(float);
+    const size_t nb2 = 0;
+    const size_t nb3 = 0;
+
+    const int n_embd = q->ne[0];
+    const int n_head = q->ne[1];
+    GGML_ASSERT(n_embd == 128 && n_head == 4);
+
+    if (n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
+        constexpr int WARPS_PER_BLOCK = 8;
+        constexpr int K_VECS_PER_BLOCK = 64;
+
+        dim3 block(32, WARPS_PER_BLOCK);
+        int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+        int num_batch_blocks = (n_batch + LIGHTNING_INDEXER_TILE_TOKENS - 1) / LIGHTNING_INDEXER_TILE_TOKENS;
+        dim3 grid(num_kv_blocks, num_batch_blocks, n_stream);
+
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F16)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q4_0)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q4_1)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q5_0)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q5_1)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q8_0)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_BF16)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F32)
+        GGML_ABORT("fatal error");
+    } else {
+        constexpr int K_VECS_PER_WARP = 8;
+        constexpr int WARPS_PER_BLOCK = 8;
+        constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+
+        dim3 block(32, WARPS_PER_BLOCK);
+        int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+        dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+        GGML_ABORT("fatal error");
+    }
+}
+
+// the reduce kernel handles at most 256*32 = 8192 candidates per block; longer
+// chunks are split into sub-chunks, each producing its own partial table
+constexpr int64_t LDXTK_SUBCHUNK = 8192;
+
+void ggml_cuda_ldxtk_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+
+    const int32_t n_top  = dst->op_params[0];
+    const int32_t chunk  = dst->op_params[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_top == 256 || n_top == 512 || n_top == 1024);
+    GGML_ASSERT(chunk <= 2 * LDXTK_SUBCHUNK);
+
+    const int64_t n_batch  = q->ne[2];
+    const int64_t n_kv     = k->ne[2];
+    const int64_t n_chunks = (n_kv + chunk - 1) / chunk;
+    const int64_t n_half   = (chunk + LDXTK_SUBCHUNK - 1) / LDXTK_SUBCHUNK;
+
+    float * scratch = (float *) dst->data;                // [n_tokens, chunk]
+    float * partial = scratch + n_batch * chunk;          // [n_chunks*n_half, n_tokens, n_top, 2]
+
+    cudaStream_t stream = ctx.stream();
+
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        const int64_t kvn = std::min<int64_t>(chunk, n_kv - c * chunk);
+
+        ggml_cuda_ldxtk_score_chunk(ctx, dst, c);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (kvn < chunk) {
+            ldxtk_scratch_fill_kernel<<<n_batch, 256, 0, stream>>>(scratch, kvn, chunk, n_batch);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        for (int64_t h = 0; h < n_half; ++h) {
+            const int64_t off  = h * LDXTK_SUBCHUNK;
+            const int64_t kvn_h = std::min<int64_t>(LDXTK_SUBCHUNK, kvn - off);
+            float * out_c = partial + (c * n_half + h) * n_batch * n_top * 2;
+            // kvn_h == 0 launches an all-dead table so every slot is defined
+            ldxtk_launch_reducer_0(
+                n_top, scratch + off, nullptr, std::max<int64_t>(0, kvn_h), n_batch, out_c, nullptr, c * chunk + off, chunk, 0, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+}
+
+void ggml_cuda_ldxtk_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * partial = dst->src[0];
+    const ggml_tensor * q       = partial->src[0];
+    const ggml_tensor * k       = partial->src[1];
+
+    const int32_t n_top  = partial->op_params[0];
+    const int32_t chunk  = partial->op_params[1];
+
+    GGML_ASSERT(n_top == 256 || n_top == 512 || n_top == 1024);
+
+    const int64_t n_batch  = q->ne[2];
+    const int64_t n_kv     = k->ne[2];
+    const int64_t n_chunks = (n_kv + chunk - 1) / chunk;
+
+    float * partial_f = (float *) partial->data;
+    const size_t n_scratch = (size_t) n_batch * chunk;
+    float2 * tables = (float2 *) (partial_f + n_scratch); // [n_chunks*n_half, n_tokens, n_top, 2]
+    float2 * temp   = (float2 *) partial_f;               // one table in the scratch region
+
+    const size_t table_floats = (size_t) n_batch * n_top * 2;
+    GGML_ASSERT(n_scratch >= table_floats && "ldxtk: scratch too small for a merge table");
+
+    const int64_t n_half   = (chunk + LDXTK_SUBCHUNK - 1) / LDXTK_SUBCHUNK;
+    int64_t n_tab          = n_chunks * n_half;
+    const int64_t n_group  = LDXTK_SUBCHUNK / n_top;  // tables per launch (<= 8192 candidates)
+
+    cudaStream_t stream = ctx.stream();
+
+    // one launch merges at most n_group tables (<= 8192 candidates per block);
+    // reduce more in rounds, reusing the scratch region for the merged table.
+    // table n_out never aliases an input of the current round (n_out < c0).
+    while (n_tab > 1) {
+        int64_t n_out = 0;
+        for (int64_t c0 = 0; c0 < n_tab; c0 += n_group) {
+            const int64_t n_in = std::min<int64_t>(n_group, n_tab - c0);
+            ldxtk_launch_reducer_1(
+                n_top, nullptr, (float *) (tables + c0 * n_batch * n_top), n_in * n_top,
+                n_batch, (float *) temp, nullptr, 0, 0, n_batch * n_top, stream);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(
+                (float *) (tables + n_out * n_batch * n_top), (float *) temp,
+                table_floats * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            ++n_out;
+        }
+        n_tab = n_out;
+    }
+
+    float * out0 = (float *) dst->data;
+    float * out1 = (float *) dst->data + (size_t) n_top * n_batch;
+    ldxtk_launch_reducer_2(n_top, nullptr, (float *) tables, n_top, n_batch, out0, out1, 0, 0, 0, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_ldxtk_chunk_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * m = dst->src[3]; // mask
+
+    const int32_t n_top = dst->op_params[0];
+
+    if (n_top != 256 && n_top != 512 && n_top != 1024) {
+        return false;
+    }
+
+    if (q->ne[0] != 128 || q->ne[1] != 4) {
+        return false;
+    }
+
+    // single stream only
+    if (q->ne[3] != 1 || k->ne[3] != 1 || dst->src[2]->ne[3] != 1 || m->ne[3] != 1) {
+        return false;
+    }
+
+    // alignment checks
+    for (const ggml_tensor * t : {q, k}) {
+        if (ggml_is_quantized(t->type)) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+
+    switch(k->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_ldxtk_merge_supported(int device, const ggml_tensor * dst) {
+    const ggml_tensor * partial = dst->src[0];
+    if (partial->op != GGML_OP_LIDX_TOPK_CHUNK) {
+        return false;
+    }
+    return ggml_cuda_ldxtk_chunk_supported(device, partial);
+}
