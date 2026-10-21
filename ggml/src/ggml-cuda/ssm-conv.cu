@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
@@ -209,7 +210,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 }
 
 // ---------------------------------------------------------------------------------------------
-// [gfx906 A1] fused recurrent conv step (port of furnace ssm-conv.cu "conv_step_concat").
+// [gfx906 T6] fused recurrent conv step (port of furnace ssm-conv.cu "conv_step_concat").
 //
 // The decode / verify graph of qwen4exp builds, per GDN layer:
 //     GET_ROWS(conv cache, ids) -> RESHAPE -> CONCAT(state, transpose(x)) -> CPY(slot0..N) -> SSM_CONV -> SILU
@@ -320,8 +321,21 @@ static const ggml_tensor * conv_step_root(const ggml_tensor * t) {
     return t;
 }
 
+// Tolerant env parsing: a switch counts as set only for an explicit 1/on/true/yes; 0/off/false/no
+// and unset leave it alone (`getenv(...) != nullptr` would treat "=0" as set). Same semantics as
+// gfx906_env_on() in common.cuh, kept local because the fusion is self-contained here.
+static bool conv_step_env_on(const char * name, bool def = false) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 ||
+             strcmp(v, "no") == 0);
+}
+
+// GFX906_CONV_STEP_OFF=1 opts out; unset (or 0/off/false/no) keeps the fusion on.
 static bool conv_step_disabled() {
-    static const bool disabled = getenv("GGML_CUDA_NO_CONV_STEP_FUSION") != nullptr ||
+    static const bool disabled = conv_step_env_on("GFX906_CONV_STEP_OFF") ||
         (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0);
     return disabled;
 }

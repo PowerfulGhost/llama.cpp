@@ -2640,7 +2640,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
-// [gfx906 A1] the conv-step matcher lives in ssm-conv.cu and needs these two
+// [gfx906 T6] the conv-step matcher lives in ssm-conv.cu and needs these two
 bool ggml_cuda_is_view_or_noop_public(const ggml_tensor * t) {
     return ggml_cuda_is_view_or_noop(t);
 }
@@ -3621,7 +3621,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    // [gfx906 A1] recurrent conv step: GET_ROWS(conv cache) -> CONCAT -> state-tail CPYs (+ SSM_CONV/SILU)
+    // [gfx906 T6] recurrent conv step: GET_ROWS(conv cache) -> CONCAT -> state-tail CPYs (+ SSM_CONV/SILU)
     // in one launch. Matched at the CONCAT so the compute loop can skip the gather.
     if (node->op == GGML_OP_CONCAT) {
         const int n = ggml_cuda_try_conv_step_fusion(*cuda_ctx, cgraph, i);
@@ -4554,7 +4554,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // [gfx906 A1] a conv-state gather read in place by its fused conv step
+                // [gfx906 T6] a conv-state gather read in place by its fused conv step
                 if (node->op == GGML_OP_GET_ROWS && ggml_cuda_conv_state_gather_elidable(cgraph, node)) {
                     continue;
                 }
@@ -4850,7 +4850,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
 
-        // [gfx906 A1] pull each conv step's SSM_CONV -> SILU behind its CONCAT's state-tail CPYs
+        // [gfx906 T6] pull each conv step's SSM_CONV -> SILU behind its CONCAT's state-tail CPYs
         ggml_cuda_conv_step_graph_optimize(cgraph);
     }
 

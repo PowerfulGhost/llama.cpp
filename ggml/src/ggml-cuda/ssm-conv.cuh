@@ -2,7 +2,7 @@
 
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
 
-// [gfx906 A1] fused recurrent conv step: GET_ROWS(conv cache) -> CONCAT(state, x^T) -> the state-tail
+// [gfx906 T6] fused recurrent conv step: GET_ROWS(conv cache) -> CONCAT(state, x^T) -> the state-tail
 // CPYs (+ optionally SSM_CONV -> SILU) in one launch. Returns the number of nodes after i the launch
 // covered, or -1 when the CONCAT at i does not qualify.
 int  ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
