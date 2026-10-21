@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include "unary.cuh"
 #include "quantize.cuh"
-#include "q8_repack/repack.cuh"
+#include "gfx906-repack/repack.cuh"
 #include "ggml-impl.h"
 #include "../ggml-backend-impl.h"
 
