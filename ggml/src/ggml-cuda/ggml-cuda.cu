@@ -4376,9 +4376,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
-    // [gfx906-opt P2] SIGMOID -> MUL -> ADD: b + a*sigmoid(g), the gate g one
-    // value per row (shared-expert gate / hyperconnection combine). 3 launches -> 1,
-    // same intra-element arithmetic order (no FMA contraction) -> bit-identical.
+    // [gfx906-opt T5] SIGMOID -> MUL -> ADD: dst = b + a*sigmoid(g), one gate value per row.
+    // 3 launches -> 1. Same arithmetic order as the solo ops (no FMA contraction) -> bit-identical.
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
         static const bool no_sma = getenv("GFX906_SMA_FUSION_OFF") != nullptr;
         ggml_tensor * mul = cgraph->nodes[i + 1];
@@ -4396,9 +4395,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
                     ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
                     ggml_is_contiguous(add) &&
-                    // tailored memory check (the generic checker vetoes any
-                    // dead-input chunk overlap; the fused kernel only needs
-                    // its live operands to stay out of dst's storage):
+                    // generic checker vetoes dead-input overlap; only live operands must stay out of dst
                     [&]() {
                         static const bool no_custom_mem = getenv("GFX906_SMA_NO_CUSTOM_MEM") != nullptr;
                         if (no_custom_mem) {
@@ -4416,7 +4413,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         const bool ok3 = !ov(a, add) && (b_alias || !ov(b, add)) && !ov(g, add);
                         return ok3;
                     }()) {
-                                ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, (ggml_tensor *) g,
+                ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, (ggml_tensor *) g,
                         (ggml_tensor *) a, (ggml_tensor *) b, add);
                 GGML_LOG_INFO("[gfx906-sma] fused sigmoid-mul-add: g=%s a=%s b=%s dst=%s\n", g->name, a->name, b->name, add->name);
                 return 2;

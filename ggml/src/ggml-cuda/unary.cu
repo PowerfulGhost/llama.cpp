@@ -779,21 +779,19 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
     }
 }
 
-/* [gfx906-opt P2] fused sigmoid -> mul -> add: y = b + a*sigmoid(g), the gate g
- * converted to fixed values (qwen4exp hyperconnection / shared-expert interpretation
- * boundary combine). Row-major elementwise; per-element arithmetic in the same
- * order as the three solo launches -> bit-identical. */
+/* [gfx906-opt T5] fused sigmoid -> mul -> add: dst = b + a*sigmoid(g), one gate value per row.
+ * Same per-element arithmetic order as the three solo ops -> bit-identical. */
 static __global__ void sigmoid_mul_add_kernel(
         const int n_cols, const int n_rows,
         const float * __restrict__ gate,   // [n_rows]
         const float * __restrict__ a,
         const float * __restrict__ b,
         float * __restrict__ dst) {
-        // no FMA contraction: match the solo-launch rounding sequence (mul, then add)
-        #pragma clang fp contract(off)
-        for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
-            i < (int64_t) n_cols * n_rows;
-            i += (int64_t) gridDim.x * blockDim.x) {
+    // no FMA contraction: match the solo-launch rounding sequence (mul, then add)
+    #pragma clang fp contract(off)
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
+         i < (int64_t) n_cols * n_rows;
+         i += (int64_t) gridDim.x * blockDim.x) {
         const int row = (int) (((int64_t) i / n_cols) % n_rows);
         const float g = gate[row];
         const float sig = 1.0f / (1.0f + expf(-g));
