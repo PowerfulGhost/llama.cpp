@@ -29,7 +29,8 @@ static bool gfx906_f32_env_on(const char * name, bool def) {
     if (v == nullptr || *v == '\0') {
         return def;
     }
-    if (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F') {
+    if (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F' ||
+            strcmp(v, "off") == 0 || strcmp(v, "OFF") == 0) {
         return false;
     }
     return true;

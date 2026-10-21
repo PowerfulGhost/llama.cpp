@@ -3613,33 +3613,38 @@ struct f32m_group {
 
 static std::vector<f32m_group> f32m_build_plan(const struct ggml_cgraph * cgraph) {
     std::vector<f32m_group> plan;
-    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> by_src1;
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, const ggml_tensor *>>> by_src1;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT || !ggml_cuda_f32_multi_ok(node) || node->ne[1] != 1) {
             continue;
         }
-        by_src1[node->src[1]].push_back(node);
+        by_src1[node->src[1]].push_back({i, node});
     }
     for (auto & [src1, members0] : by_src1) {
         if (members0.size() < 2) {
             continue;
         }
         f32m_group g{};
-        g.head = members0[0];
+        g.head = members0[0].second;
+        const int head_idx = members0[0].first;
         for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
-            if (k > 0 && members0[k]->src[0]->ne[0] != g.head->src[0]->ne[0]) {
+            // same liveness hazard as q8m: only group graph-adjacent members (see E8)
+            if (members0[k].first != head_idx + g.n) {
+                break;
+            }
+            if (k > 0 && members0[k].second->src[0]->ne[0] != g.head->src[0]->ne[0]) {
                 continue;
             }
-            bool aligned = (uintptr_t) g.head->src[1]->data % 16 == 0 && (uintptr_t) members0[k]->data % 16 == 0;
-            aligned &= (uintptr_t) members0[k]->src[0]->data % 16 == 0;
+            bool aligned = (uintptr_t) g.head->src[1]->data % 16 == 0 && (uintptr_t) members0[k].second->data % 16 == 0;
+            aligned &= (uintptr_t) members0[k].second->src[0]->data % 16 == 0;
             if (!aligned) {
                 continue;
             }
-            if (!ggml_is_contiguous(members0[k]->src[1])) {
+            if (!ggml_is_contiguous(members0[k].second->src[1])) {
                 continue;
             }
-            g.mms[g.n++] = members0[k];
+            g.mms[g.n++] = members0[k].second;
         }
         if (g.n >= 2) {
             plan.push_back(g);
