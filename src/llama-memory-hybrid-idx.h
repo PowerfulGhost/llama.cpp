@@ -193,7 +193,7 @@ public:
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     // Worst-case pool count of this context: the cache size over the pool size times the number of
     // streams. It does not depend on the current state, so the graph can size its work buffers from it
-    // and the compute-buffer plan then covers every ubatch (see P11 16).
+    // and the compute-buffer plan then covers every ubatch (see the T10 card).
     uint32_t get_n_pool_max () const;
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones

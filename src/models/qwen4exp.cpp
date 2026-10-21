@@ -696,6 +696,22 @@ public:
     uint32_t n_kv  = 0;
 };
 
+// Tolerant parsing of the GGML_LIDX_TOPK knob. It is a mode selector (D16: mode selectors keep
+// their name), with three states:
+//   unset / anything else   auto: the fusion is used when it pays off
+//   0 / off / false / no    the plain path: the full [n_pool, n_tokens] score matrix
+//   2                       force the fusion regardless of the size threshold
+// `getenv(...) != nullptr` would make =0 *enable* the plain path - the footgun the tolerant
+// convention exists for. The shared helper gfx906_env_on() lives in T1's common.cuh, so the
+// parser stays local here (same as the T6/T7/T8 knobs).
+static bool qsa_ldxtk_env_off(const char * v) {
+    if (v == nullptr || *v == '\0') {
+        return false;
+    }
+    return strcmp(v, "0") == 0 || strcmp(v, "off") == 0 ||
+           strcmp(v, "false") == 0 || strcmp(v, "no") == 0;
+}
+
 // QSA top-k fusion (GGML_LIDX_TOPK, default on): the [n_pool, n_tokens] f32 score matrix is the
 // largest compute-buffer item at long context (2 GiB per layer at 16x128k), so the pool is scored in
 // chunks and a per-chunk top-k is streamed instead. The scores are identical, only the order of exact
@@ -703,8 +719,8 @@ public:
 //
 // The decision must not depend on the current pool count: the reserve graph walks the full pool while
 // a runtime graph walks the pools of the moment, and a different choice gives the two graphs a
-// different topology, which forces a gallocr re-reserve plus an 8-device sync on every ubatch (P11 16).
-// The worst-case pool count and the ubatch size are the same in both graphs.
+// different topology, which forces a gallocr re-reserve plus an 8-device sync on every ubatch
+// (see the T10 card). The worst-case pool count and the ubatch size are the same in both graphs.
 //
 // n_top_sel is the width of the selection: with the fusion it is the worst-case width, so the graph
 // keeps its shape when the pool is still small (the extra slots are dead and get masked out).
@@ -713,14 +729,9 @@ static bool qsa_ldxtk_plan(
         const llama_cparams &                  cparams,
         const llama_hparams &                  hparams,
         int64_t &                              n_top_sel) {
-    static const bool env_ldxtk = []() {
-        const char * env = getenv("GGML_LIDX_TOPK");
-        return !env || strcmp(env, "0") != 0;
-    }();
-    static const bool env_ldxtk_force = []() {
-        const char * env = getenv("GGML_LIDX_TOPK");
-        return env && strcmp(env, "2") == 0;
-    }();
+    static const char * const env_val        = getenv("GGML_LIDX_TOPK");
+    static const bool        env_ldxtk       = !qsa_ldxtk_env_off(env_val);
+    static const bool        env_ldxtk_force = env_val && strcmp(env_val, "2") == 0;
 
     const int64_t kpool      = hparams.indexer_kpool;
     const int64_t n_pool_max = mctx_hyb->get_n_pool_max();
@@ -860,7 +871,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // QSA top-k fusion (GGML_LIDX_TOPK, default on): see qsa_ldxtk_plan. The decision is taken from the
     // worst-case pool count and the ubatch size, so the reserve graph and the runtime graphs have the
-    // same topology and the compute-buffer plan stays valid (P11 16).
+    // same topology and the compute-buffer plan stays valid (see the T10 card).
     int64_t n_top_sel = 0;
     const bool use_ldxtk = qsa_ldxtk_plan(mctx_hyb, cparams, hparams, n_top_sel);
 
