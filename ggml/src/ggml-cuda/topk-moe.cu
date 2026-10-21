@@ -2,7 +2,10 @@
 #include "ggml.h"
 #include "topk-moe.cuh"
 
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 
 // Kernel config struct - passed by value to CUDA kernel
@@ -277,6 +280,157 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
+// Wide-router rank kernel (GCN; port of furnace topk_moe_rank_cuda). One row per block, one expert
+// per thread. Softmax is monotonic and the renormalisation over the selected k cancels its
+// denominator, so the kernel ranks the raw logits and exponentiates only the k winners:
+//   w_k = exp(l_k - l_max) / sum_{selected} exp(l_j - l_max)
+// Expert i's rank is #{j : key_j > key_i or (key_j == key_i and j < i)} on ordered float bits, so a
+// rank is n_expert compares instead of n_expert_used dependent argmax butterflies (the serial
+// argmax costs 10 butterflies plus 10 LDS round trips of the taken mask at 512 experts: 20 us vs 13).
+// Used when: no bias, plain softmax, weights renormalised (with_norm; the clamp never binds since the
+// top k hold at least k/n of the mass) or the delayed softmax over the selected logits.
+// Outputs match the serial kernel up to summation order.
+
+#if defined(GGML_USE_HIP)
+// [gfx906] tolerant opt-out parsing (D16): 1/on/true/yes disables the rank kernel, 0/off/false/no and
+// unset keep it on. A plain `getenv(...) != nullptr` would make GFX906_TOPK_MOE_RANK_OFF=0 *disable*
+// the kernel -- the same footgun that bit the P4 HC up-pre flip.
+static bool topk_moe_rank_off(void) {
+    const char * v = getenv("GFX906_TOPK_MOE_RANK_OFF");
+    if (v == nullptr || *v == '\0') {
+        return false;
+    }
+    char buf[8] = {0};
+    for (int i = 0; i < 7 && v[i] != '\0'; i++) {
+        buf[i] = (char) std::tolower((unsigned char) v[i]);
+    }
+    return strcmp(buf, "1") == 0 || strcmp(buf, "on") == 0 || strcmp(buf, "true") == 0 || strcmp(buf, "yes") == 0;
+}
+#endif // defined(GGML_USE_HIP)
+
+static __device__ __forceinline__ uint32_t topk_moe_ordered_bits(const float v) {
+    const uint32_t u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+template <int n_experts>
+__launch_bounds__(n_experts)
+__global__ void topk_moe_rank_cuda(const float * logits, float * weights, int32_t * ids, const int n_rows,
+        const int n_expert_used, const float scale_val) {
+    // 64-expert waves: one expert per thread, keys read from LDS as wave-uniform (broadcast) uint4.
+    // The tie term only exists for the two 32-expert chunks overlapping this wave's own experts:
+    // chunks below use >=, chunks above use >.
+    static_assert(n_experts == 256 || n_experts == 512, "one expert per thread, 64-expert waves");
+    constexpr int n_chunks = n_experts / 32;
+    __shared__ __attribute__((aligned(16))) uint32_t keys[n_experts];
+    __shared__ float chosen[64];
+    const int row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const int t = threadIdx.x;
+    logits  += (size_t) n_experts * row;
+    weights += (size_t) n_expert_used * row;
+    ids     += (size_t) n_experts * row;
+
+    float v = logits[t];
+    if (__isnanf(v)) {
+        v = -INFINITY;
+    }
+    const uint32_t k = topk_moe_ordered_bits(v);
+    keys[t] = k;
+    __syncthreads();
+
+#if defined(GGML_USE_HIP)
+    const int wave = __builtin_amdgcn_readfirstlane(t >> 6);
+#else
+    const int wave = t >> 6;
+#endif
+    const uint4 * k4 = reinterpret_cast<const uint4 *>(keys);
+    int rank = 0;
+    // chunks entirely below this wave's experts: every equal key has the lower index
+    for (int c = 0; c < 2 * wave; c++) {
+        uint4 q[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            q[u] = k4[c * 8 + u];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            rank += (q[u].x >= k) + (q[u].y >= k) + (q[u].z >= k) + (q[u].w >= k);
+        }
+    }
+    // the two chunks holding this wave's own experts
+#pragma unroll
+    for (int cc = 0; cc < 2; cc++) {
+        const int c = 2 * wave + cc;
+        uint4 q[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            q[u] = k4[c * 8 + u];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const int jb = c * 32 + 4 * u;
+            rank += (q[u].x > k) + ((q[u].x == k) & (jb + 0 < t));
+            rank += (q[u].y > k) + ((q[u].y == k) & (jb + 1 < t));
+            rank += (q[u].z > k) + ((q[u].z == k) & (jb + 2 < t));
+            rank += (q[u].w > k) + ((q[u].w == k) & (jb + 3 < t));
+        }
+    }
+    // chunks entirely above: equal keys there rank below us
+    for (int c = 2 * wave + 2; c < n_chunks; c++) {
+        uint4 q[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            q[u] = k4[c * 8 + u];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            rank += (q[u].x > k) + (q[u].y > k) + (q[u].z > k) + (q[u].w > k);
+        }
+    }
+
+    if (rank < n_expert_used) {
+        ids[rank]    = t;
+        chosen[rank] = v;
+    }
+    __syncthreads();
+
+    // softmax over the k winners (== full softmax renormalised over the top k). t < 64 is one whole
+    // gfx906 wave; warp_reduce_* is WARP_SIZE = 32 lanes wide here, which is why the applicability
+    // check caps n_expert_used at WARP_SIZE.
+    if (t < 64) {
+        const float x = t < n_expert_used ? chosen[t] : -INFINITY;
+        const float m = warp_reduce_max(x);
+        const float e = t < n_expert_used ? (x == m ? 1.0f : expf(x - m)) : 0.0f; // all -inf rows stay finite
+        const float s = warp_reduce_sum(e);
+        if (t < n_expert_used) {
+            weights[t] = e / s * scale_val;
+        }
+    }
+}
+
+static bool topk_moe_rank_applicable(ggml_backend_cuda_context & ctx, const int n_expert, const int n_expert_used,
+        const float clamp_val, const topk_moe_config config, const bool has_bias) {
+#if defined(GGML_USE_HIP)
+    static const bool disabled = topk_moe_rank_off();
+    const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
+    if (disabled || !GGML_CUDA_CC_IS_GCN(dev.cc) || dev.warp_size != 64 || has_bias || config.use_sigmoid ||
+            config.use_sqrt_softplus || n_expert_used > WARP_SIZE || (n_expert != 256 && n_expert != 512)) {
+        return false;
+    }
+    if (config.with_norm) {
+        // the top k of n hold at least k/n of the softmax mass, so the clamp cannot bind
+        return clamp_val <= (float) n_expert_used / (float) n_expert;
+    }
+    return config.delayed_softmax;
+#else
+    GGML_UNUSED_VARS(ctx, n_expert, n_expert_used, clamp_val, config, has_bias);
+    return false;
+#endif
+}
+
 template<bool has_bias>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -291,10 +445,19 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const topk_moe_config       config) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
+    cudaStream_t stream = ctx.stream();
+    if (topk_moe_rank_applicable(ctx, n_expert, n_expert_used, clamp_val, config, has_bias)) {
+        if (n_expert == 512) {
+            topk_moe_rank_cuda<512><<<n_rows, 512, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, scale_val);
+        } else {
+            topk_moe_rank_cuda<256><<<n_rows, 256, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, scale_val);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const int    rows_per_block = TOPK_MOE_ROWS_PER_BLOCK;
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
-    cudaStream_t stream = ctx.stream();
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
     switch (n_expert) {
