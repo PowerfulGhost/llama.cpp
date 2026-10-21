@@ -4828,7 +4828,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [gfx906-opt T5] SIGMOID -> MUL -> ADD: dst = b + a*sigmoid(g), one gate value per row.
     // 3 launches -> 1. Same arithmetic order as the solo ops (no FMA contraction) -> bit-identical.
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
-        static const bool no_sma = getenv("GFX906_SMA_FUSION_OFF") != nullptr;
+        // tolerant parsing (plan G5): GFX906_SMA_FUSION_OFF=1|on|true|yes disables the fusion,
+        // =0|off|false|no or unset keeps it on.
+        static const bool no_sma = gfx906_env_on("GFX906_SMA_FUSION_OFF", false);
         ggml_tensor * mul = cgraph->nodes[i + 1];
         ggml_tensor * add = cgraph->nodes[i + 2];
         const ggml_tensor * g = node->src[0];
