@@ -1455,6 +1455,10 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // graph the compute loop is currently dispatching; an op may consult the nodes around it
+    // (see ggml_cuda_gdn_state_gather_elidable)
+    const ggml_cgraph * cur_cgraph = nullptr;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
