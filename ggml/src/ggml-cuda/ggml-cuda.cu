@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/gfx906-repack/repack.cuh"
+#include "ggml-cuda/gfx906-hc-up-pre.cuh"
 #include "ggml-cuda/gfx906-f32.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -3966,6 +3967,104 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
     return plan;
 }
 
+// [gfx906 T3] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL at node i
+// (qwen4exp hc combine weights, combine and the next hc mix norm) in one launch;
+// sma_*: the block output is the shared-expert combine SIGMOID -> MUL -> ADD, folded in
+// (the caller checks that DSV4_HC_POST reads it). Returns the number of nodes after i it
+// covered, 0 = not fused. dry: only report whether it would run (nothing launched).
+// [gfx906 T3] out-of-order invalidation for a node evaluated ahead of its place
+static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * n) {
+    if (n == nullptr || n->data == nullptr) return;
+    const char * lo = (const char *) n->data;
+    const char * hi = lo + ggml_nbytes(n);
+    for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+        auto & e = cuda_ctx->repack_xq[k];
+        if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+        if (e.producer_nbytes == 0) continue;
+        const char * elo = (const char *) e.producer_data;
+        const char * ehi = elo + e.producer_nbytes;
+        if (lo < ehi && elo < hi) e.gen = 0;
+    }
+}
+
+// [gfx906 T3] the per-eval hc-fusion observability (hit/veto tallies) lived here and was
+// moved to opt/diag-instrumentation (plan §15): a T branch must not carry diagnostic code.
+
+static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+        const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
+    // [gfx906 T3, default-on] E10-b paired benches: ①+② = tg128 36.48 -> 39.03 (+7.0%),
+    // PPL delta within ±1σ; the single non-bitwise site is pinned to ① hc_up_pre's F32
+    // rounding order (permanent, opt-out via GFX906_HC_*_OFF=1). Defaults now ship on.
+    const bool no_hc_norm = gfx906_env_on("GFX906_HC_POST_NORM_OFF");
+    if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * sc1  = cgraph->nodes[i];
+    ggml_tensor * sig  = cgraph->nodes[i + 1];
+    ggml_tensor * sc2  = cgraph->nodes[i + 2];
+    ggml_tensor * post = cgraph->nodes[i + 3];
+    ggml_tensor * norm = cgraph->nodes[i + 4];
+    ggml_tensor * mul  = cgraph->nodes[i + 5];
+    // bias bytes exactly as the solo scale kernel reads them (op_params[1]);
+    // garbage there is deterministic per build and must be reproduced
+    float b_in  = 0.0f;
+    float b_out = 0.0f;
+    memcpy(&b_in,  (const float *) sc1->op_params + 1, sizeof(float));
+    memcpy(&b_out, (const float *) sc2->op_params + 1, sizeof(float));
+    const float s_in  = ggml_get_op_params_f32(sc1, 0);
+    const float s_out = ggml_get_op_params_f32(sc2, 0);
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            sig->src[0] != sc1 || sc2->src[0] != sig || sc2->op != GGML_OP_SCALE ||
+            post->op != GGML_OP_DSV4_HC_POST || post->src[2] != sc2 ||
+            !ggml_node_has_n_uses(cgraph, i + 2, 1) ||
+            norm->op != GGML_OP_RMS_NORM || norm->src[0] != post || !ggml_node_has_n_uses(cgraph, i + 4, 1) ||
+            mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm) ||
+            !(post->flags & GGML_TENSOR_FLAG_COMPUTE) || !(norm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_are_same_stride(sc1->src[0], sc2)) {
+        return 0;
+    }
+    // the launcher checks which overlaps of outputs and inputs its kernel tolerates
+    if (dry) {
+        return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
+    }
+    void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, mul);
+    if (!ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, b_in, s_out, b_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
+        // the q8 emit slot was claimed before the launcher vetoed: never-written q8 in the
+        // ring must not survive (a later consumer whose pool range aliases mul would take a
+        // false cache hit); the per-node invalidation skips its own producer
+        for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
+            auto & e = cuda_ctx->repack_xq[k];
+            if (e.gen == cuda_ctx->graph_gen && (e.producer == mul || (mul->data && e.data == mul->data))) {
+                e.gen = 0;
+            }
+        }
+        return 0;
+    }
+    // [gfx906 T3, default off] the emit only pays off if its entry survives the
+    // fused-chain sweep in the dispatch loop: MUL is evaluated in place over RMS_NORM's
+    // output, so the swept norm node aliases the producer (see
+    // ggml_backend_cuda_context::q8_emit_producer). Opt-in GFX906_P2_HCPN_EMIT=1: the
+    // dedicated 4-arm default-vs-opt-out A/B (+0.29%, n=2/side) did not clear 1%
+    // (see experiment-2026-10-18/p2-q8-emit/RESULTS.md §3.1).
+    static const bool keep_emit = gfx906_env_on("GFX906_P2_HCPN_EMIT");
+    if (keep_emit && yq != nullptr) {
+        cuda_ctx->q8_emit_producer = mul;
+    }
+    return 5;
+}
+
+// [gfx906 T3] byte-range overlap of two tensors' storage
+static bool ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b || a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+    const char * alo = (const char *) a->data;
+    const char * ahi = alo + ggml_nbytes(a);
+    const char * blo = (const char *) b->data;
+    const char * bhi = blo + ggml_nbytes(b);
+    return alo < bhi && blo < ahi;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4872,6 +4971,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+
+    // [gfx906 T3] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL
+    // (qwen4exp hc combine + the next hc mix norm): 6 launches -> 1
+    if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
+        static const bool no_hcpn = gfx906_env_on("GFX906_HC_POST_NORM_OFF"); // default on (non-bitwise site = ① only; see T3 card)
+        if (!no_hcpn) {
+            const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
+            if (n_hc > 0) {
+                return n_hc;
+            }
+            // the plain hc-post pattern veto'd on shape/liveness: fall through to the
+            // later branches (canonical path)
+        }
+    }
+
+    // [gfx906 T3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
+    // (qwen4exp hc mix, single-token rows): 4 launches -> 1, not bitwise (see gfx906-hc-up-pre.cu)
+    // Note: hc_up_pre runs as its own branch, and its veto on shape/liveness is what
+    // turns into a canonical-chain fallback.
+    if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
+        static const bool no_hcup = gfx906_env_on("GFX906_HC_UP_PRE_OFF"); // default on (E10-b: +4.1% alone; non-bitwise pinned single site)
+        ggml_tensor * silu = cgraph->nodes[i + 1];
+        ggml_tensor * up   = cgraph->nodes[i + 2];
+        ggml_tensor * rs   = cgraph->nodes[i + 3];
+        ggml_tensor * pre  = cgraph->nodes[i + 4];
+        if (!no_hcup && silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+                silu->src[0] == node && up->op == GGML_OP_MUL_MAT && rs->op == GGML_OP_RESHAPE &&
+                rs->src[0] == up && pre->op == GGML_OP_DSV4_HC_PRE && pre->src[1] == rs) {
+            // the RESHAPE is a view: plain use counts (furnace semantics); the chain's
+            // other consumers are audited inside ggml_cuda_hc_up_pre_ok
+            if (ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                    (silu->flags & GGML_TENSOR_FLAG_COMPUTE) && (up->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    (pre->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_hc_up_pre_ok(node, silu, up, pre) &&
+                    // tailored liveness check (the fused kernel writes pre and reads lo/xn;
+                    // skipped outputs and weights may alias anything safely)
+                    node->src[0] && !ranges_overlap(node->src[0], pre) &&
+                    !ranges_overlap(pre->src[0], pre)) {
+                void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, pre);
+                ggml_cuda_hc_up_pre(*cuda_ctx, node, up, pre, yq);
+                return 4;
+            }
+            // structural match but vetoed (shape gate / liveness / ok()): falls through to
+            // the canonical path
+        }
+    }
+
+
+    // [gfx906 T3] SCALE -> SILU (hc mix outside hc_up_pre's token window)
+    if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
+            gfx906_env_on("GFX906_SCALE_SILU") && node->src[0]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
+            ggml_nelements(node->src[0]) == ggml_nelements(cgraph->nodes[i + 1]) &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            !ranges_overlap(node->src[0], cgraph->nodes[i + 1])) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -5131,14 +5291,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->cur_cgraph = cgraph;
 
             // [gfx906-opt P2] invalidate cached q8_1 activations overlapping a
-            // node's write range (producer-safe: never drop own entry).
-            const auto q8x_invalidate = [&](const ggml_tensor * n) {
+            // node's write range (producer-safe: never drop own entry). keep: producer of a
+            // q8_1 emit this very launch wrote, whose entry survives the alias
+            const auto q8x_invalidate = [&](const ggml_tensor * n, const void * keep = nullptr) {
                 if (n == nullptr || n->data == nullptr) return;
                 const char * lo = (const char *) n->data;
                 const char * hi = lo + ggml_nbytes(n);
                 for (size_t k = 0; k < ggml_backend_cuda_context::REPACK_XQ_CACHE_N; ++k) {
                     auto & e = cuda_ctx->repack_xq[k];
                     if (e.gen != cuda_ctx->graph_gen || e.producer == nullptr || e.producer == n) continue;
+                    if (keep != nullptr && e.producer == keep) continue;
                     if (e.producer_nbytes == 0) continue;
                     const char * elo = (const char *) e.producer_data;
                     const char * ehi = elo + e.producer_nbytes;
@@ -5148,6 +5310,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // [gfx906-opt P2] before any dispatch: this node will write its output range
                 q8x_invalidate(node);
+                cuda_ctx->q8_emit_producer = nullptr;
 
                 // [gfx906 P2.2] F32 grouped mat-vec
                 if (!f32m_member_of.empty()) {
@@ -5173,9 +5336,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
-                    // fused chains write multiple outputs: invalidate each
+                    // fused chains write multiple outputs: invalidate each; the q8_1 emit one
+                    // of them wrote (if any) survives its own producer's aliases
+                    const void * q8_keep = cuda_ctx->q8_emit_producer;
+                    cuda_ctx->q8_emit_producer = nullptr;
                     for (int k = 1; k <= nodes_to_skip; ++k) {
-                        q8x_invalidate(cgraph->nodes[i + k]);
+                        q8x_invalidate(cgraph->nodes[i + k], q8_keep);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;

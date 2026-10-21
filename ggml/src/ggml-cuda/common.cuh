@@ -1470,6 +1470,10 @@ struct ggml_backend_cuda_context {
     repack_xq_cache_entry repack_xq[REPACK_XQ_CACHE_N];
     size_t repack_xq_next = 0;
     std::vector<void *> repack_xq_retired;
+    // [gfx906 T3] producer of the q8_1 emit the launch that just returned wrote: the
+    // fused chain's swept node ranges may alias it (MUL in place over RMS_NORM), and that
+    // alias is not a different write, so its cache entry must survive that sweep
+    const void * q8_emit_producer = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
