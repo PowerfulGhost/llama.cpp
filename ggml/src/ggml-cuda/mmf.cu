@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
+#include "gfx906-f32.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -99,6 +100,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+
+    // [gfx906] F32 GCN mat-vec family (fewwaves / grouped): takes precedence over MMVF
+    if (ids == nullptr && ggml_cuda_f32_gcn_matvec(ctx, src0, src1, dst, cc)) {
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

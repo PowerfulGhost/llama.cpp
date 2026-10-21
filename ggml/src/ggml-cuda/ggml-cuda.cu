@@ -31,6 +31,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/gfx906-f32.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -3603,6 +3604,55 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// gfx906 F32 family: up to three MUL_MAT with F32 weights (K == 2560) sharing src1.
+struct f32m_group {
+    const ggml_tensor * head;
+    std::array<const ggml_tensor *, 3> mms;
+    int n;
+};
+
+static std::vector<f32m_group> f32m_build_plan(const struct ggml_cgraph * cgraph) {
+    std::vector<f32m_group> plan;
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, const ggml_tensor *>>> by_src1;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || !ggml_cuda_f32_multi_ok(node) || node->ne[1] != 1) {
+            continue;
+        }
+        by_src1[node->src[1]].push_back({i, node});
+    }
+    for (auto & [src1, members0] : by_src1) {
+        if (members0.size() < 2) {
+            continue;
+        }
+        f32m_group g{};
+        g.head = members0[0].second;
+        const int head_idx = members0[0].first;
+        for (size_t k = 0; k < members0.size() && g.n < 3; k++) {
+            // same liveness hazard as q8m: only group graph-adjacent members (see E8)
+            if (members0[k].first != head_idx + g.n) {
+                break;
+            }
+            if (k > 0 && members0[k].second->src[0]->ne[0] != g.head->src[0]->ne[0]) {
+                continue;
+            }
+            bool aligned = (uintptr_t) g.head->src[1]->data % 16 == 0 && (uintptr_t) members0[k].second->data % 16 == 0;
+            aligned &= (uintptr_t) members0[k].second->src[0]->data % 16 == 0;
+            if (!aligned) {
+                continue;
+            }
+            if (!ggml_is_contiguous(members0[k].second->src[1])) {
+                continue;
+            }
+            g.mms[g.n++] = members0[k].second;
+        }
+        if (g.n >= 2) {
+            plan.push_back(g);
+        }
+    }
+    return plan;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4539,6 +4589,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // [gfx906 P2.2] F32 grouped mat-vec (GDN beta+alpha, router+gate)
+            std::vector<f32m_group> f32m_groups;
+            std::unordered_map<const ggml_tensor *, f32m_group *> f32m_member_of;
+            if (!ggml_cuda_f32_env_on("GFX906_F32_MULTI_OFF", false)) {
+                f32m_groups = f32m_build_plan(cgraph);
+                for (auto & g : f32m_groups) {
+                    for (int k = 0; k < g.n; k++) {
+                        f32m_member_of[g.mms[k]] = &g;
+                    }
+                }
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4579,6 +4640,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
+                }
+
+                // [gfx906 P2.2] F32 grouped mat-vec
+                if (!f32m_member_of.empty()) {
+                    auto it = f32m_member_of.find(node);
+                    if (it != f32m_member_of.end()) {
+                        if (node == it->second->head) {
+                            ggml_cuda_mul_mat_f_multi(*cuda_ctx, const_cast<ggml_tensor * const *>(it->second->mms.data()), it->second->n);
+                        }
+                        continue;
+                    }
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
