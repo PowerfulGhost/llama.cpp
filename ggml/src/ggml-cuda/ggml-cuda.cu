@@ -4536,7 +4536,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // [gfx906 A1] a GDN recurrent-state gather read in place by gated_delta_net, which
+                // [gfx906 T7] a GDN recurrent-state gather read in place by gated_delta_net, which
                 // reads the cache rows through its indices
                 if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_elidable(cgraph, node)) {
                     continue;

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 constexpr int gdn_cols_per_warp = 4;
 
@@ -259,8 +260,21 @@ static const ggml_tensor * gdn_state_root(const ggml_tensor * t) {
     return t;
 }
 
+// Tolerant env parsing: a switch counts as set only for an explicit 1/on/true/yes; 0/off/false/no
+// and unset leave it alone (`getenv(...) != nullptr` would treat "=0" as set). Same semantics as
+// gfx906_env_on() in common.cuh, kept local because the elision is self-contained here.
+static bool gdn_gather_env_on(const char * name, bool def = false) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "off") == 0 ||
+             strcmp(v, "no") == 0);
+}
+
 bool ggml_cuda_gdn_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_tensor * gr) {
-    static const bool disabled = getenv("GGML_CUDA_NO_GDN_GATHER_FUSION") != nullptr;
+    // GFX906_GDN_GATHER_OFF=1 opts out; unset (or 0/off/false/no) keeps the elision on.
+    static const bool disabled = gdn_gather_env_on("GFX906_GDN_GATHER_OFF");
     if (disabled || cgraph == nullptr || gr == nullptr || gr->op != GGML_OP_GET_ROWS ||
             (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
             gr->type != GGML_TYPE_F32 || gr->src[0]->type != GGML_TYPE_F32 || gr->src[1]->type != GGML_TYPE_I32 ||
