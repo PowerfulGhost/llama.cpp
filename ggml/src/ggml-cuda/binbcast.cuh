@@ -11,7 +11,7 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 void ggml_cuda_op_fused_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
 void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
 
-// ===== [gfx906 P6] adjacent elementwise chain =====
+// ===== [gfx906 P6 -> T9] adjacent elementwise chain =====
 // A run of 2..8 adjacent, single-consumer F32 elementwise nodes with one shape
 // (ADD/SUB/MUL/DIV, SCALE, CLAMP, SQRT, SQR and the unary family) is evaluated by
 // one kernel instead of one launch per node. Per element the ops are applied in the
@@ -56,5 +56,11 @@ struct gfx906_elem_chain_plan {
     int                         n = 0;
 };
 
+// Control surface (mode selector, name unchanged per D16):
+//   GFX906_ELEM_CHAIN unset/1            -> fuses and launches (default ON)
+//   GFX906_ELEM_CHAIN 0/off/false/no     -> off (tolerant parse in ggml-cuda.cu)
+//   GFX906_ELEM_CHAIN=dry                -> match + validate only, no launch (census)
+//   GFX906_ELEM_CHAIN_DEBUG=1            -> hit tallies; _MISS=1 -> rejection reasons
+//
 // dry = match only (stats/launch-free). Returns the number of nodes covered (>=2) or 0.
 int  gfx906_elem_chain_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, bool dry);

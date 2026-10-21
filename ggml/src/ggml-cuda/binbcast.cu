@@ -587,7 +587,7 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
-// ===== [gfx906 P6] adjacent elementwise chain: 2..8 nodes -> 1 launch =====
+// ===== [gfx906 P6 -> T9] adjacent elementwise chain: 2..8 nodes -> 1 launch =====
 // Why: every elementwise node in this model is one launch of ~4.2 us GPU time no matter
 // how small the tensor is (measured 581 elementwise launches/token, 2.44 ms/token in
 // experiment-2026-10-18/current-trace). Chains of 2..8 single-consumer nodes are already

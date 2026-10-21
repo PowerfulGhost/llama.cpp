@@ -4393,10 +4393,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    // [gfx906 P6, default ON] adjacent elementwise chain: 2..8 single-use nodes of one
+    // [gfx906 P6 -> T9, default ON] adjacent elementwise chain: 2..8 single-use nodes of one
     // shape (ADD/SUB/MUL/DIV/SCALE/CLAMP/SQRT/SQR + unary family) in one launch.
     // tg128 +1.28% mean / +1.92% median over 8 arms/side, bit-identical (greedy md5,
-    // PPL 4.1982/4.2150 both sides) -- T20, experiment-2026-10-18/p6-elem-chain.
+    // PPL 4.1982/4.2150 both sides) -- T9, experiment-2026-10-18/p6-elem-chain.
     // Env: GFX906_ELEM_CHAIN=0/off disables, =dry matches/validates and reports only.
     // Runs LAST so every pattern above (hc chain, conv step, up/gate GLU, sma,
     // softcap) keeps its own head node instead of having it swallowed here.
