@@ -999,8 +999,9 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
 
     // Custom PCIe-friendly AllReduce (GPU-barrier kernels, no NCCL proxy
-    // threads).  On by default; GGML_ENABLE_CUSTOM_AR=0 turns it off.  Without
-    // a peer-write coherent fabric it stays on the NCCL path by itself.
+    // threads).  On by default; GGML_ENABLE_CUSTOM_AR=0|off|false|no turns it
+    // off.  Without a peer-write coherent fabric it stays on the NCCL path by
+    // itself.
     ggml_cuda_tp::CustomARContext custom_ar;
     bool use_custom_ar = false;
 
@@ -1244,9 +1245,11 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     // Custom AR can coexist with NCCL/internal.  The top-level dispatch tries
-    // it first for eligible F32 tensors unless GGML_ENABLE_CUSTOM_AR=0 is set.
-    const char * env_custom_ar = getenv("GGML_ENABLE_CUSTOM_AR");
-    const bool enabled_via_env = env_custom_ar == nullptr || env_custom_ar[0] == '\0' || env_custom_ar[0] != '0';
+    // it first for eligible F32 tensors unless GGML_ENABLE_CUSTOM_AR is set to
+    // 0|off|false|no.
+    // tolerant parsing (plan G5): unset / empty / =1|on|true|yes keep the custom
+    // path enabled, =0|off|false|no disable it.
+    const bool enabled_via_env = gfx906_env_on("GGML_ENABLE_CUSTOM_AR", true);
     const bool supported_nranks = n_backends >= 2 && n_backends <= (size_t) ggml_cuda_tp::kMaxRanks;
     if (enabled_via_env && supported_nranks) {
         ggml_cuda_tp::tp_custom_ar_init(&ret->custom_ar, (int) n_backends, ret->dev_ids.data());
