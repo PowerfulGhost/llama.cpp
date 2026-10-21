@@ -32,7 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/gfx906-repack/repack.cuh"
-#include "ggml-cuda/hc-up-pre.cuh"
+#include "ggml-cuda/gfx906-hc-up-pre.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -3759,12 +3759,12 @@ static std::vector<q8m_group> q8m_build_plan(const struct ggml_cgraph * cgraph, 
     return plan;
 }
 
-// [gfx906-opt P3] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL at node i
+// [gfx906 T3] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL at node i
 // (qwen4exp hc combine weights, combine and the next hc mix norm) in one launch;
 // sma_*: the block output is the shared-expert combine SIGMOID -> MUL -> ADD, folded in
 // (the caller checks that DSV4_HC_POST reads it). Returns the number of nodes after i it
 // covered, 0 = not fused. dry: only report whether it would run (nothing launched).
-// [gfx906-opt P3.3] out-of-order invalidation for a node evaluated ahead of its place
+// [gfx906 T3] out-of-order invalidation for a node evaluated ahead of its place
 static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * n) {
     if (n == nullptr || n->data == nullptr) return;
     const char * lo = (const char *) n->data;
@@ -3779,50 +3779,18 @@ static void q8x_invalid_range(ggml_backend_cuda_context * cuda_ctx, const ggml_t
     }
 }
 
-// [gfx906-opt P3.5] per-eval hc-fusion observability (GFX906_HC_DEBUG=1): hit counters
-// every hc-chain branch, printed and reset at each graph evaluation, so a "silently not
-// fused" fallback (cparams, shape gates, liveness vetoes) becomes a visible fact instead
-// of an invisible regression risk on rebase.
-struct gfx906_hc_dbg {
-    long hcup_candidates = 0;  // SCALE->SILU->MM(up)->RESHAPE->HC_PRE structural pattern matched
-    long hcup_hit        = 0;  // full gate passed, fused kernel launched
-    long hcpn_candidates = 0;  // hc-post-shaped site where try_hc_post_norm was invoked
-    long hcpn_hit        = 0;  // post-norm chain fused
-    long hcsma_hit       = 0;  // sma variant with hc fold
-    long hcsma_candidates = 0; // sma-shaped sites whose hc-fold pattern missed
-    long scsilu_hit      = 0;  // SCALE->SILU wide-batch fallback
-    long emits           = 0;  // hc fusions whose q8_1 emit was actually produced
-};
-static gfx906_hc_dbg g_hc_dbg;
-static void gfx906_hc_dbg_flush() {
-    static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
-    if (!on) {
-        return;
-    }    if (g_hc_dbg.hcup_candidates || g_hc_dbg.hcpn_candidates || g_hc_dbg.hcup_hit ||
-        g_hc_dbg.hcpn_hit || g_hc_dbg.hcsma_hit || g_hc_dbg.hcsma_candidates || g_hc_dbg.scsilu_hit || g_hc_dbg.emits) {
-        fprintf(stderr,
-                "[gfx906-hc] hcup cand=%ld hit=%ld | hcpn cand=%ld hit=%ld | hcsma cand=%ld hit=%ld | scsilu=%ld | emits=%ld\n",
-                g_hc_dbg.hcup_candidates, g_hc_dbg.hcup_hit,
-                g_hc_dbg.hcpn_candidates, g_hc_dbg.hcpn_hit,
-                g_hc_dbg.hcsma_candidates, g_hc_dbg.hcsma_hit, g_hc_dbg.scsilu_hit, g_hc_dbg.emits);
-    }
-    g_hc_dbg = {};
-}
-static bool g_hc_dbg_enabled() {
-    static const bool on = gfx906_env_on("GFX906_HC_DEBUG");
-    return on;
-}
+// [gfx906 T3] the per-eval hc-fusion observability (hit/veto tallies) lived here and was
+// moved to opt/diag-instrumentation (plan §15): a T branch must not carry diagnostic code.
 
 static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
-    // [gfx906-opt P4 default-on] E10-b paired benches: ①+② = tg128 36.48 -> 39.03 (+7.0%),
+    // [gfx906 T3, default-on] E10-b paired benches: ①+② = tg128 36.48 -> 39.03 (+7.0%),
     // PPL delta within ±1σ; the single non-bitwise site is pinned to ① hc_up_pre's F32
-    // rounding order (permanent, opt-out via GFX906_HC_* = 0/off). Defaults now ship on.
-    const bool no_hc_norm = !gfx906_env_on("GFX906_HC_POST_NORM", true);
+    // rounding order (permanent, opt-out via GFX906_HC_*_OFF=1). Defaults now ship on.
+    const bool no_hc_norm = gfx906_env_on("GFX906_HC_POST_NORM_OFF");
     if (no_hc_norm || i + 5 >= cgraph->n_nodes) {
         return 0;
     }
-    ++g_hc_dbg.hcpn_candidates;
     ggml_tensor * sc1  = cgraph->nodes[i];
     ggml_tensor * sig  = cgraph->nodes[i + 1];
     ggml_tensor * sc2  = cgraph->nodes[i + 2];
@@ -3864,8 +3832,7 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
         }
         return 0;
     }
-    ++g_hc_dbg.emits;
-    // [gfx906-opt P2, default off] the emit only pays off if its entry survives the
+    // [gfx906 T3, default off] the emit only pays off if its entry survives the
     // fused-chain sweep in the dispatch loop: MUL is evaluated in place over RMS_NORM's
     // output, so the swept norm node aliases the producer (see
     // ggml_backend_cuda_context::q8_emit_producer). Opt-in GFX906_P2_HCPN_EMIT=1: the
@@ -3878,7 +3845,7 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
     return 5;
 }
 
-// [gfx906-opt P3] byte-range overlap of two tensors' storage
+// [gfx906 T3] byte-range overlap of two tensors' storage
 static bool ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     if (!a || !b || a->data == nullptr || b->data == nullptr) {
         return false;
@@ -4741,31 +4708,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
-    // [gfx906-opt P3.2] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL
+    // [gfx906 T3] SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL
     // (qwen4exp hc combine + the next hc mix norm): 6 launches -> 1
     if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
-        static const bool no_hcpn = !gfx906_env_on("GFX906_HC_POST_NORM", true); // default on (non-bitwise site = ① only; see T12 card)
+        static const bool no_hcpn = gfx906_env_on("GFX906_HC_POST_NORM_OFF"); // default on (non-bitwise site = ① only; see T3 card)
         if (!no_hcpn) {
-            ++g_hc_dbg.hcpn_candidates;
             const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
             if (n_hc > 0) {
-                ++g_hc_dbg.hcpn_hit;
                 return n_hc;
             }
             // the plain hc-post pattern veto'd on shape/liveness: fall through to the
-            // later branches (canonical path); the candidate count keeps it visible
-            // under GFX906_HC_DEBUG
+            // later branches (canonical path)
         }
     }
 
-    // [gfx906-opt P3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
-    // (qwen4exp hc mix, single-token rows): 4 launches -> 1, not bitwise (see hc-up-pre.cu)
-    // Note: returning 0 after the sma/hc-post-norm branches above (sma already ran its own
-    // hc-post chain) must not be masked: hc_up_pre runs as its own branch, and its veto on
-    // shape/liveness is what turns into a canonical-chain fallback.
+    // [gfx906 T3] SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE(gated)
+    // (qwen4exp hc mix, single-token rows): 4 launches -> 1, not bitwise (see gfx906-hc-up-pre.cu)
+    // Note: hc_up_pre runs as its own branch, and its veto on shape/liveness is what
+    // turns into a canonical-chain fallback.
     if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
-        static const bool no_hcup = !gfx906_env_on("GFX906_HC_UP_PRE", true); // default on (E10-b: +4.1% alone; non-bitwise pinned single site)
+        static const bool no_hcup = gfx906_env_on("GFX906_HC_UP_PRE_OFF"); // default on (E10-b: +4.1% alone; non-bitwise pinned single site)
         ggml_tensor * silu = cgraph->nodes[i + 1];
         ggml_tensor * up   = cgraph->nodes[i + 2];
         ggml_tensor * rs   = cgraph->nodes[i + 3];
@@ -4773,7 +4736,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (!no_hcup && silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
                 silu->src[0] == node && up->op == GGML_OP_MUL_MAT && rs->op == GGML_OP_RESHAPE &&
                 rs->src[0] == up && pre->op == GGML_OP_DSV4_HC_PRE && pre->src[1] == rs) {
-            ++g_hc_dbg.hcup_candidates;
             // the RESHAPE is a view: plain use counts (furnace semantics); the chain's
             // other consumers are audited inside ggml_cuda_hc_up_pre_ok
             if (ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
@@ -4785,24 +4747,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     node->src[0] && !ranges_overlap(node->src[0], pre) &&
                     !ranges_overlap(pre->src[0], pre)) {
                 void * yq = ggml_cuda_hc_up_pre_emit_target(*cuda_ctx, cgraph, pre);
-                if (yq != nullptr) {
-                    ++g_hc_dbg.emits;
-                }
                 ggml_cuda_hc_up_pre(*cuda_ctx, node, up, pre, yq);
-                ++g_hc_dbg.hcup_hit;
-                static int hdbg_n = getenv("GFX906_HCUP_DEBUG") ? 0 : 6;
-                if (hdbg_n++ < 6) {
-                    fprintf(stderr, "[gfx906-hcup] fused: pre=%s ntok=%lld yq=%d\n", pre->name, (long long) pre->ne[1], yq != nullptr);
-                }
                 return 4;
             }
             // structural match but vetoed (shape gate / liveness / ok()): falls through to
-            // the canonical path and stays visible that way in the GFX906_HC_DEBUG tally.
+            // the canonical path
         }
     }
 
 
-    // [gfx906-opt P3.4] SCALE -> SILU (hc mix outside hc_up_pre's token window)
+    // [gfx906 T3] SCALE -> SILU (hc mix outside hc_up_pre's token window)
     if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
             gfx906_env_on("GFX906_SCALE_SILU") && node->src[0]->type == GGML_TYPE_F32 &&
@@ -4811,9 +4765,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_node_get_use_count(cgraph, i) == 1 &&
             !ranges_overlap(node->src[0], cgraph->nodes[i + 1])) {
         ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
-        ++g_hc_dbg.scsilu_hit;
-        static int ss_dbg_n = getenv("GFX906_SCALESILU_DEBUG") ? 0 : 40;
-        if (ss_dbg_n++ < 40) fprintf(stderr, "[scale-silu] i=%d %s(s=%g bias=%g) -> %s\n", i, node->name, (double) ggml_get_op_params_f32(node, 0), (double) ((const float *) node->op_params)[1], cgraph->nodes[i + 1]->name);
         return 1;
     }
 
@@ -4839,7 +4790,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
-    gfx906_hc_dbg_flush();   // per-eval HC_DEBUG tally: prints and resets the previous eval's counters
     cuda_ctx->graph_gen++;   // [gfx906-opt P2] per-eval generation for the q8_1 activation cache
 
     // flag used to determine whether it is an integrated_gpu

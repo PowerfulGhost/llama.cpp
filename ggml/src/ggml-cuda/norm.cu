@@ -757,7 +757,7 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-// [gfx906-opt P3] q8_1 of one value per lane, 32 consecutive lanes = one block: the
+// [gfx906 T3] q8_1 of one value per lane, 32 consecutive lanes = one block: the
 // arithmetic of quantize_q8_1 (our consumer's quantize cache entry then hits exactly)
 static __device__ __forceinline__ void gfx906_rms_emit_q8_1(block_q8_1 * yq, const int64_t idx, const float v) {
     float amax = fabsf(v);
@@ -774,7 +774,7 @@ static __device__ __forceinline__ void gfx906_rms_emit_q8_1(block_q8_1 * yq, con
     }
 }
 
-// [gfx906-opt P3] b + a *sigmoid(g) exactly as sigmoid_mul_add_f32 computes it: no
+// [gfx906 T3] b + a *sigmoid(g) exactly as sigmoid_mul_add_f32 computes it: no
 // contraction anywhere, including the expf expansion
 static __device__ __forceinline__ float gfx906_hc_sma_combine(const float b, const float a, const float g) {
 #pragma clang fp contract(off)
@@ -782,7 +782,7 @@ static __device__ __forceinline__ float gfx906_hc_sma_combine(const float b, con
     return b + a * s;
 }
 
-// [gfx906-opt P3] qwen4exp hc combine + the next hc mix norm, one block per (stream, token):
+// [gfx906 T3] qwen4exp hc combine + the next hc mix norm, one block per (stream, token):
 // w = sigmoid(s_in*inject) * s_out (same product order as SCALE -> SIGMOID -> SCALE),
 // post = x*w + residual (dsv4_hc_post_f32 element order), then RMS_NORM -> MUL with
 // rms_norm_f32's block_reduce structure (1024 threads, cols strided). SMA: x is the
@@ -835,7 +835,7 @@ static __global__ void __launch_bounds__(1024) hc_post_rms_norm_mul_q8_f32(
     }
 }
 
-// [gfx906-opt P3] host: SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL in one
+// [gfx906 T3] host: SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL in one
 // launch; sma_* fold the shared-expert combine (b + a*sigmoid(g)) in as post's x.
 bool ggml_cuda_op_hc_post_rms_norm_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * inject, ggml_tensor * post,
         const float s_in, const float b_in, const float s_out, const float b_out, const ggml_tensor * norm, ggml_tensor * mul_tensor, void * yq,
