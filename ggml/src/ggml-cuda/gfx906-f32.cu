@@ -8,6 +8,7 @@
 // mat-vec products over the same activation in one go.
 #include "common.cuh"
 #include "mmf.cuh"
+#include "gfx906-f32.cuh"
 #include "../ggml-backend-impl.h"
 
 // E17.2 (2026-10-17) BUGFIX: the guard used to be `defined(GGML_USE_HIP) && defined(__gfx906__)`.
@@ -24,7 +25,13 @@
 
 // Tolerant env parsing: GFX906_F32 is DEFAULT-ON; only an explicit 0/off/false/no
 // disables it. `getenv(...) != nullptr` would make GFX906_F32=0 *enable* it.
-static bool gfx906_f32_env_on(const char * name, bool def) {
+// Exposed through gfx906-f32.cuh so that the `_OFF`-style switches (e.g.
+// GFX906_F32_MULTI_OFF, read from ggml-cuda.cu) use the SAME parser instead of
+// the "present => off" form that PLAYBOOK section 3 forbids.
+// Semantics: returns def when the variable is unset/empty; false when the value
+// is 0/off/false/no (any case); true otherwise. For an `_OFF` switch the caller
+// inverts the result, i.e. `!env_on("..._OFF", false)` == "feature is on".
+bool ggml_cuda_f32_env_on(const char * name, bool def) {
     const char * v = getenv(name);
     if (v == nullptr || *v == '\0') {
         return def;
@@ -241,7 +248,7 @@ bool ggml_cuda_f32_gcn_matvec(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         ggml_tensor * dst, int cc) {
 #if GCN_F32_ENABLED
-    static const bool enabled = gfx906_f32_env_on("GFX906_F32", true);
+    static const bool enabled = ggml_cuda_f32_env_on("GFX906_F32", true);
     GGML_TENSOR_BINARY_OP_LOCALS;
     // E17.2 diagnosis: dump every F32 mat-vec candidate shape that reaches this hook,
     // with whether the family fired. Bounded so graph capture stays readable.
@@ -258,8 +265,8 @@ bool ggml_cuda_f32_gcn_matvec(
         return false;
     }
     constexpr int warp_size = 64;
-    static const bool no_rows  = !gfx906_f32_env_on("GFX906_F32_ROWS", true);
-    static const bool no_nc    = !gfx906_f32_env_on("GFX906_F32_NC", true);
+    static const bool no_rows  = !ggml_cuda_f32_env_on("GFX906_F32_ROWS", true);
+    static const bool no_nc    = !ggml_cuda_f32_env_on("GFX906_F32_NC", true);
 
     if (cc == 0 || !GGML_CUDA_CC_IS_GCN(cc) || src0->type != GGML_TYPE_F32 ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -355,10 +362,10 @@ bool ggml_cuda_f32_gcn_matvec(
 
 bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
 #if GCN_F32_ENABLED
-    if (!gfx906_f32_env_on("GFX906_F32", true)) {
+    if (!ggml_cuda_f32_env_on("GFX906_F32", true)) {
         return false;
     }
-    static const bool disabled = !gfx906_f32_env_on("GFX906_F32_MULTI", true);
+    static const bool disabled = !ggml_cuda_f32_env_on("GFX906_F32_MULTI", true);
     if (disabled || mm->op != GGML_OP_MUL_MAT) {
         return false;
     }

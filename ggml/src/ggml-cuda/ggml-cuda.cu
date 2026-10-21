@@ -4547,7 +4547,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // [gfx906 P2.2] F32 grouped mat-vec (GDN beta+alpha, router+gate)
             std::vector<f32m_group> f32m_groups;
             std::unordered_map<const ggml_tensor *, f32m_group *> f32m_member_of;
-            if (getenv("GFX906_F32_MULTI_OFF") == nullptr) {
+            if (!ggml_cuda_f32_env_on("GFX906_F32_MULTI_OFF", false)) {
                 f32m_groups = f32m_build_plan(cgraph);
                 for (auto & g : f32m_groups) {
                     for (int k = 0; k < g.n; k++) {
