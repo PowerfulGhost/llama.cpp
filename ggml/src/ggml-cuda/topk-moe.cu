@@ -2,7 +2,10 @@
 #include "ggml.h"
 #include "topk-moe.cuh"
 
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 
 // Kernel config struct - passed by value to CUDA kernel
@@ -287,6 +290,24 @@ __global__ void topk_moe_cuda(const float *         logits,
 // Used when: no bias, plain softmax, weights renormalised (with_norm; the clamp never binds since the
 // top k hold at least k/n of the mass) or the delayed softmax over the selected logits.
 // Outputs match the serial kernel up to summation order.
+
+#if defined(GGML_USE_HIP)
+// [gfx906] tolerant opt-out parsing (D16): 1/on/true/yes disables the rank kernel, 0/off/false/no and
+// unset keep it on. A plain `getenv(...) != nullptr` would make GFX906_TOPK_MOE_RANK_OFF=0 *disable*
+// the kernel -- the same footgun that bit the P4 HC up-pre flip.
+static bool topk_moe_rank_off(void) {
+    const char * v = getenv("GFX906_TOPK_MOE_RANK_OFF");
+    if (v == nullptr || *v == '\0') {
+        return false;
+    }
+    char buf[8] = {0};
+    for (int i = 0; i < 7 && v[i] != '\0'; i++) {
+        buf[i] = (char) std::tolower((unsigned char) v[i]);
+    }
+    return strcmp(buf, "1") == 0 || strcmp(buf, "on") == 0 || strcmp(buf, "true") == 0 || strcmp(buf, "yes") == 0;
+}
+#endif // defined(GGML_USE_HIP)
+
 static __device__ __forceinline__ uint32_t topk_moe_ordered_bits(const float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -393,7 +414,7 @@ __global__ void topk_moe_rank_cuda(const float * logits, float * weights, int32_
 static bool topk_moe_rank_applicable(ggml_backend_cuda_context & ctx, const int n_expert, const int n_expert_used,
         const float clamp_val, const topk_moe_config config, const bool has_bias) {
 #if defined(GGML_USE_HIP)
-    static const bool disabled = getenv("GGML_CUDA_NO_TOPK_MOE_RANK") != nullptr;
+    static const bool disabled = topk_moe_rank_off();
     const ggml_cuda_device_info::cuda_device_info & dev = ggml_cuda_info().devices[ctx.device];
     if (disabled || !GGML_CUDA_CC_IS_GCN(dev.cc) || dev.warp_size != 64 || has_bias || config.use_sigmoid ||
             config.use_sqrt_softplus || n_expert_used > WARP_SIZE || (n_expert != 256 && n_expert != 512)) {
