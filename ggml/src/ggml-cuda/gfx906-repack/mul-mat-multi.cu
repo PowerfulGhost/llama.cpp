@@ -221,6 +221,6 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
         mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
     }
     CUDA_CHECK(cudaGetLastError());
-    // (HIP-only project: q8_repack/ always builds with HIP; the MUSA path goes
+    // (HIP-only project: gfx906-repack/ always builds with HIP; the MUSA path goes
     // through the repack.cuh inline stubs and never reaches this TU.)
 }

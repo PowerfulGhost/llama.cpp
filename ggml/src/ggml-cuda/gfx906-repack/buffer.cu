@@ -53,7 +53,7 @@ static void repack_witness(const ggml_tensor * tensor, int device) {
     const int d = device >= 0 && device < GGML_CUDA_MAX_DEVICES ? device : 0;
     if (!s_witnessed[tensor->type][d]) {
         s_witnessed[tensor->type][d] = true;
-        GGML_LOG_WARN("q8_repack: repacking %s tensors on device %d (first: %s, %zu bytes)\n",
+        GGML_LOG_WARN("gfx906-repack: repacking %s tensors on device %d (first: %s, %zu bytes)\n",
             ggml_type_name(tensor->type), device, tensor->name, ggml_nbytes(tensor));
     }
 }

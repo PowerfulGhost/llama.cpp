@@ -158,7 +158,7 @@ from the matching offset in the base scale plane; hits just return the pointer.
 
 ## Build and integration
 
-- Sources are collected by `file(GLOB ... "q8_repack/*.cu" / "q8_repack/*.cuh")`
+- Sources are collected by `file(GLOB ... "gfx906-repack/*.cu" / "gfx906-repack/*.cuh")`
   in **both** `ggml-cuda/CMakeLists.txt` and `ggml-hip/CMakeLists.txt`. Adding or
   renaming files requires a reconfigure.
 - Enabled only on gfx906 (the arch the kernels compile for); elsewhere the
@@ -172,7 +172,7 @@ Integration points in `ggml-cuda.cu` (the only TU outside the folder that sees
 
 | Site | Hook |
 |---|---|
-| top of file | `#include "ggml-cuda/q8_repack/repack.cuh"` |
+| top of file | `#include "ggml-cuda/gfx906-repack/repack.cuh"` |
 | `get_extra_bufts` | `ggml_backend_cuda_repack_buffer_type(dev)` - expose the repack buft to the loader |
 | `device_supports_buft` | `ggml_backend_buft_is_cuda_repack(buft)` - claim repacked tensors |
 | `device_supports_op` | reject a repacked weight unless it is `src0` of `MUL_MAT` / `MUL_MAT_ID` with f32 src1/dst; accepts a view whose base is supported |
