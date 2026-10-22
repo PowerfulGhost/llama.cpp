@@ -5,7 +5,22 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
+// gfx906 wavefronts are 64 lanes wide, so HIP's __ballot_sync ballots the whole wavefront while the block
+// decomposition below (like the rest of this backend) is WARP_SIZE == 32 lanes, i.e. two logical warps per
+// wavefront. Without taking the half-wave's own 32 bits out of the 64-bit ballot every selected column is
+// counted twice and the running row offsets overshoot, which leaves the tail of the index list unwritten.
+static __device__ __forceinline__ uint32_t flash_attn_mask_ballot(const bool selected, const int warp) {
+    return (uint32_t) (__ballot_sync(~(uint64_t) 0, selected) >> (32*(warp & 1)));
+}
+#else
+static __device__ __forceinline__ uint32_t flash_attn_mask_ballot(const bool selected, const int warp) {
+    GGML_UNUSED_VARS(warp);
+    return __ballot_sync(0xFFFFFFFF, selected);
+}
+#endif // defined(GGML_USE_HIP)
+
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
 __launch_bounds__(256, 1)
@@ -49,7 +64,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
                     selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
                 }
             }
-            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
+            selected_warp[item] = flash_attn_mask_ballot(selected, warp);
             warp_count += __popc(selected_warp[item]);
         }
 
@@ -76,7 +91,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         for (int item = 0; item < values_per_lane; ++item) {
             const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
             const int dst = row_count + warp_offsets[warp] + warp_item_offset + __popc(selected_warp[item] & lane_mask);
-            if ((selected_warp[item] & (uint32_t(1) << lane)) && dst < n_kv_max) {
+            if ((selected_warp[item] & (1u << lane)) && dst < n_kv_max) {
                 indices[dst] = i;
             }
             warp_item_offset += __popc(selected_warp[item]);
@@ -101,13 +116,13 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(mask, indices, counts, n_queries, ncols1, n_kv_max, stream);
-    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA / HIP");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
@@ -122,7 +137,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
