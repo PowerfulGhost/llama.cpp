@@ -8,10 +8,12 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    8
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    0
+// patch 1 = upstream added GGML_OP_TOP_K_MASK (+1 op)
+// patch 2 = we added GGML_OP_LIDX_TOPK_CHUNK / GGML_OP_LIDX_TOPK_MERGE (+2 ops)
+#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

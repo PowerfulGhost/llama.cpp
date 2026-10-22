@@ -774,6 +774,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    auto handle_pool_1d = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        return src_ss[0];
+    };
+
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
@@ -798,6 +805,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         for (size_t i = 0; i < 4; i++) {
             GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    };
+
+    // [gfx906 T10] The ldxtk ops score the kv pool in chunks and then merge the per-chunk top-k
+    // tables. The meta backend cannot express that merge across devices: GGML_BACKEND_SPLIT_AXIS_PARTIAL
+    // means "each backend holds a partial *sum*", which is not a top-k merge, and the chunk boundaries
+    // themselves depend on the per-device kv slice. The only case the meta backend can serve is the one
+    // where every input is already replicated (MIRRORED): each device then computes the identical result
+    // redundantly, exactly like the single-device path. A split input stays a hard error (never a silently
+    // wrong result), but with a message that names the op and the workaround instead of the generic
+    // "ggml op not implemented" fallback.
+    auto handle_ldxtk_topk = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            if (src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                GGML_ABORT("meta backend: %s is not supported with split inputs (src %zu is split along %s); "
+                           "use -sm layer, or turn the QSA ldxtk fusion off (GGML_LIDX_TOPK=0)",
+                           ggml_op_name(tensor->op), i, ggml_backend_meta_split_axis_name(src_ss[i].axis));
+            }
         }
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     };
@@ -990,11 +1019,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONV_3D:
             case GGML_OP_CONV_2D_DW:
             case GGML_OP_CONV_TRANSPOSE_2D:
-            case GGML_OP_POOL_1D:
             case GGML_OP_POOL_2D:
             case GGML_OP_POOL_2D_BACK:
             case GGML_OP_UPSCALE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_POOL_1D: {
+                split_state = handle_pool_1d(src_ss);
             } break;
             case GGML_OP_PAD: {
                 split_state = handle_pad(src_ss);
@@ -1046,8 +1077,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_TOP_K_MASK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_LIDX_TOPK_CHUNK:
+            case GGML_OP_LIDX_TOPK_MERGE: {
+                split_state = handle_ldxtk_topk(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -2284,8 +2320,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->ctx.reset(ggml_init(params));
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                for (size_t i = 0; i < n_subgraphs; i++) {
-                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
+                for (size_t i = 0; i < backend_ctx->max_subgraphs; i++) {
+                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
                 }
             }
             backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);
