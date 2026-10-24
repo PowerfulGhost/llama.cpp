@@ -1231,7 +1231,9 @@ static void gfx906_sparse_attn_log_witness(const ggml_tensor * dst, const int nc
     }
 }
 
-static bool ggml_cuda_fattn_tile_shall_use_sparse(const ggml_tensor * dst, const int ncols1) {
+// Witness for the *declined* case: without it, a shallow probe sees nothing at all and G5
+// (生效证据) reports a false negative. One-shot, like the enabled witness above.
+static const char * gfx906_sparse_attn_decline_reason(const ggml_tensor * dst, const int ncols1) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
@@ -1241,18 +1243,33 @@ static bool ggml_cuda_fattn_tile_shall_use_sparse(const ggml_tensor * dst, const
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    // QSA: n_sel, an upper bound of the cells one query can see. The compaction drops indices beyond it,
-    // so this being a true bound is a correctness prerequisite, not just a heuristic.
     const int32_t n_kv_max_query = ggml_get_op_params_i32(dst, 4);
 
-    return gfx906_sparse_attn_enabled()
-        && ncols1 == 1 && Q->ne[1] == 1 && dst->src[4] == nullptr
-        && mask != nullptr && mask->type == GGML_TYPE_F16
-        && max_bias == 0.0f && logit_softcap == 0.0f
-        && mask->ne[0] == K->ne[1]
-        && n_kv_max_query > 0
-        && K->ne[1] >= 16384
-        && int64_t(n_kv_max_query)*8 <= K->ne[1];
+    if (!gfx906_sparse_attn_enabled())                                    return "GFX906_SPARSE_ATTN_OFF";
+    if (ncols1 != 1 || Q->ne[1] != 1 || dst->src[4] != nullptr)           return "not a single-query decode";
+    if (mask == nullptr || mask->type != GGML_TYPE_F16)                   return "mask missing or not f16";
+    if (max_bias != 0.0f || logit_softcap != 0.0f)                        return "max_bias/logit_softcap != 0";
+    if (mask->ne[0] != K->ne[1])                                          return "mask width != n_kv";
+    if (n_kv_max_query <= 0)                                              return "no QSA index";
+    if (K->ne[1] < 16384)                                                 return "n_kv < 16384";
+    if (int64_t(n_kv_max_query)*8 > K->ne[1])                             return "index window too wide";
+    return nullptr;   // 没有拒绝理由 ⇒ 可用（这一行必须返回 nullptr，否则上面任何"取反"的用法都会静默禁用稀疏）
+}
+
+static void gfx906_sparse_attn_log_declined(const ggml_tensor * dst, const int ncols1) {
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("gfx906 sparse attn: NOT used (%s), n_kv %d\n",
+                      gfx906_sparse_attn_decline_reason(dst, ncols1), int(dst->src[1]->ne[1]));
+    }
+}
+
+// Single source of truth: "should we use sparse?" is "is there any decline reason?".
+// Keeping one expression avoids the two copies drifting apart (the witness would then
+// report a reason the gate no longer agrees with).
+static bool ggml_cuda_fattn_tile_shall_use_sparse(const ggml_tensor * dst, const int ncols1) {
+    return gfx906_sparse_attn_decline_reason(dst, ncols1) == nullptr;
 }
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
@@ -1333,6 +1350,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
                         (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, true, warp_size);
                     return;
                 }
+                gfx906_sparse_attn_log_declined(dst, cols_per_block/ncols2);
             }
 
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false>;
