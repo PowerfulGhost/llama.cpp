@@ -566,6 +566,54 @@ static __global__ void lightning_indexer_kernel_tile(
         );                                                                                  \
     } else
 
+// [T15] 同 LIGHTNING_INDEXER_CASE，但成功发射后直接 return。理由：宏链以 `} else` 结尾，
+// 收尾语句就是它的 else 分支 —— 写 `break;` 会 switch 贯穿到下一个 case（每次调用多发射几个核，见 E-114），
+// 写 `GGML_ABORT` 会在类型匹配后无条件 abort。只有 return 是对的（本函数在派发之后无其它语句）。
+#define LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel, n_embd, n_head, K, type_K)    \
+    if (K->type == (type_K)) {                                                              \
+        if (lidx_launch_trace()) {                                                          \
+            fprintf(stderr, "[lidx-launch] kvw=%d kvb=%d grid=%d n_batch=%d n_kv=%d\n",      \
+                    kvw, (int) K_VECS_PER_BLOCK, (int) grid.x, (int) n_batch, (int) n_kv);   \
+        }                                                                                   \
+        lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+            <<<grid, block, 0, ctx.stream()>>>(                                             \
+            q_d, k_d, w_d, m_d, dst_d,                                                      \
+            n_stream, n_batch, n_kv,                                                        \
+            nb1, nb2, nb3,                                                                  \
+            nbq1, nbq2, nbq3,                                                               \
+            nbk1, nbk2, nbk3,                                                               \
+            nbw1, nbw2, nbw3,                                                               \
+            nbm1, nbm2, nbm3,                                                               \
+            nem3                                                                            \
+        );                                                                                  \
+        return;                                                                             \
+    } else
+
+
+// [T15] decode 形状的核每 warp 处理几个池键。8（上游形态）会让 kernels 溢出到 scratch
+// （VGPR 64 / Scratch_Size 144 B/线程），1 则完全不留 spill —— 实测 per-call 快 2.2×（PP8）、
+// 6.2×（TP2×PP4，把那里的 3× 税清零），且贪心 md5 逐字节一致。宽容解析：未设/空/0/off/no/false ⇒ 用新默认 1，
+// 只有显式 8 才回退到上游形态。
+
+// [T15] 发射见证：设 GFX906_LIDX_TRACE_LAUNCH=1 时每次发射打一行（用来断言"每次调用只发一个核"）。
+static bool lidx_launch_trace() {
+    static const bool on = [] {
+        const char * e = getenv("GFX906_LIDX_TRACE_LAUNCH");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
+static int lidx_decode_keys_per_warp() {
+    const char * e = getenv("GFX906_LIDX_KVW");
+    if (e == nullptr || e[0] == '\0' || strcmp(e, "0") == 0 || strcmp(e, "off") == 0 ||
+        strcmp(e, "no") == 0 || strcmp(e, "false") == 0) {
+        return 1;
+    }
+    const int v = atoi(e);
+    return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 1;
+}
+
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -717,24 +765,88 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F32)
         GGML_ABORT("fatal error");
     } else if (n_embd == 128 && n_head == 4) {
-        // a batch smaller than a token tile, use vector kernel
-        constexpr int K_VECS_PER_WARP = 8;
-        constexpr int WARPS_PER_BLOCK = 8;
-        constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+        // a batch smaller than a token tile, use vector kernel.
+        // [T15] GFX906_LIDX_KVW 选每 warp 的键数：1（默认，无 spill）或 8（上游形态）等。
+        // 两条分支的键数不同 ⇒ K_VECS_PER_BLOCK 与 grid 都跟着变，所以各写一遍。
+        const int kvw = lidx_decode_keys_per_warp();
+        switch (kvw) {
+            case 1: {
+                constexpr int K_VECS_PER_WARP = 1;
+                constexpr int WARPS_PER_BLOCK = 8;
+                constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
 
-        dim3 block(32, WARPS_PER_BLOCK);
-        int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
-        dim3 grid(num_kv_blocks, n_batch, n_stream);
+                dim3 block(32, WARPS_PER_BLOCK);
+                int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+                dim3 grid(num_kv_blocks, n_batch, n_stream);
 
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
-        GGML_ABORT("fatal error");
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+                GGML_ABORT("fatal error");
+            }
+            case 2: {
+                constexpr int K_VECS_PER_WARP = 2;
+                constexpr int WARPS_PER_BLOCK = 8;
+                constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+
+                dim3 block(32, WARPS_PER_BLOCK);
+                int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+                dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+                GGML_ABORT("fatal error");
+            }
+            case 4: {
+                constexpr int K_VECS_PER_WARP = 4;
+                constexpr int WARPS_PER_BLOCK = 8;
+                constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+
+                dim3 block(32, WARPS_PER_BLOCK);
+                int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+                dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+                GGML_ABORT("fatal error");
+            }
+            default: {
+                constexpr int K_VECS_PER_WARP = 8;
+                constexpr int WARPS_PER_BLOCK = 8;
+                constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+
+                dim3 block(32, WARPS_PER_BLOCK);
+                int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+                dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+                LIGHTNING_INDEXER_CASE_RET(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+                GGML_ABORT("fatal error");
+            }
+        }
     } else {
         GGML_ABORT("fatal error");
     }
