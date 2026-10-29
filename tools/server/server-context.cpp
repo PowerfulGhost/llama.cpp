@@ -3868,9 +3868,12 @@ private:
         // [T16] LLAMA_ARG_PROMPT_BUDGET = per-iteration prompt-token budget (vLLM max_num_batched_tokens
         //       equivalent); 0/unset = upstream behaviour. Combined with iterate_rot so that a long
         //       prompt cannot monopolize every iteration (which freezes the other slots' token streams).
+        // default 1024 tokens/iteration: measured no regression on single-stream prefill (1339 vs 1338 t/s
+        // at 128k) while bounding the per-iteration prompt work so that generating slots keep advancing.
+        // LLAMA_ARG_PROMPT_BUDGET=0 restores the upstream behaviour (one slot may fill the whole n_batch).
         static const int32_t n_prompt_budget = []() {
             const char * s = getenv("LLAMA_ARG_PROMPT_BUDGET");
-            return (s && *s) ? atoi(s) : 0;
+            return (s && *s) ? atoi(s) : 1024;
         }();
         static size_t prompt_rot = 0;   // [T16] rotating start index for the prompt pass
         int32_t n_prompt_added = 0;
