@@ -3344,6 +3344,27 @@ private:
         }
     }
 
+    // [T16] same as iterate(), but starts at `off` so that the caller can rotate the order.
+    // Used by the prompt-batching pass: with a fixed order the first slot always fills the whole
+    // n_batch budget and the other slots only get the leftovers (measured: 2-2.5x slower prefill
+    // and a frozen token stream for the starved slot). See knowledge/01-techniques/maybe/T16-*.
+    void iterate_rot(std::vector<server_slot> & slots, size_t off, std::function<void(server_slot &)> callback) {
+        if (slots.empty()) {
+            return;
+        }
+        off %= slots.size();
+        for (size_t i = 0; i < slots.size(); ++i) {
+            server_slot & slot = slots[(off + i) % slots.size()];
+            try {
+                callback(slot);
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "got exception: %s\n", e.what());
+                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                slot.release();
+            }
+        }
+    }
+
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
@@ -3844,12 +3865,26 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
+        // [T16] LLAMA_ARG_PROMPT_BUDGET = per-iteration prompt-token budget (vLLM max_num_batched_tokens
+        //       equivalent); 0/unset = upstream behaviour. Combined with iterate_rot so that a long
+        //       prompt cannot monopolize every iteration (which freezes the other slots' token streams).
+        // default 1024 tokens/iteration: measured no regression on single-stream prefill (1339 vs 1338 t/s
+        // at 128k) while bounding the per-iteration prompt work so that generating slots keep advancing.
+        // LLAMA_ARG_PROMPT_BUDGET=0 restores the upstream behaviour (one slot may fill the whole n_batch).
+        static const int32_t n_prompt_budget = []() {
+            const char * s = getenv("LLAMA_ARG_PROMPT_BUDGET");
+            return (s && *s) ? atoi(s) : 1024;
+        }();
+        static size_t prompt_rot = 0;   // [T16] rotating start index for the prompt pass
+        int32_t n_prompt_added = 0;
+
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
-                    return; // batch is full, skip remaining slots
+            iterate_rot(slots, prompt_rot++, [&](server_slot & slot) {
+                if (!add_ok || batch.size() >= n_batch ||
+                    (n_prompt_budget > 0 && n_prompt_added >= n_prompt_budget)) {
+                    return; // batch is full (or the per-iteration prompt budget is used up), skip the rest
                 }
 
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS) {
@@ -4400,6 +4435,9 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    // [T16] account the prompt tokens towards this iteration's budget
+                    n_prompt_added += (int32_t) n_tokens_cur;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
