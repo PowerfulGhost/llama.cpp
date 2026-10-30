@@ -3876,7 +3876,12 @@ private:
         // parallel at budget=0, i.e. the off switch did nothing).
         static const int32_t n_prompt_budget = []() {
             const char * s = getenv("LLAMA_ARG_PROMPT_BUDGET");
-            return (s && *s) ? atoi(s) : 1024;
+            const int32_t v = (s && *s) ? atoi(s) : 1024;
+            // witness for G5: one line, always printed at startup (budget <= 0 => upstream order)
+            SRV_INF("[T16] prompt budget = %d prompt tokens/iteration, rotating slot order %s "
+                    "(LLAMA_ARG_PROMPT_BUDGET=%s; 0 = upstream)\n",
+                    v, v > 0 ? "on" : "off", (s && *s) ? s : "<unset>");
+            return v;
         }();
         static size_t prompt_rot = 0;   // [T16] rotating start index for the prompt pass
         int32_t n_prompt_added = 0;
